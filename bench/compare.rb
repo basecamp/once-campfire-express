@@ -10,10 +10,10 @@ include BenchmarkSupport
 repo = File.expand_path("..", __dir__)
 workspace = File.dirname(repo)
 work = File.join(repo, "tmp/bench")
-options = { apps: "ruby,express", rounds: 2, duration: 4, concurrencies: "16", port: 25130,
+options = { apps: "express,rust", rounds: 2, duration: 4, concurrencies: "16", port: 25130,
   seed: File.join(workspace, "once-campfire-rust/parity/.seed/default"), preflight: false,
-  loadgen: ENV.fetch("LOADGEN", File.join(workspace, "once-campfire-elixir/target/bench/release/loadgen")),
-  env_file: ENV.fetch("BENCH_ENV_FILE", File.join(workspace, "once-campfire-elixir/parity/reference.env")),
+  loadgen: ENV.fetch("LOADGEN", File.join(workspace, "once-campfire-rust/bench/loadgen/target/release/loadgen")),
+  env_file: ENV.fetch("BENCH_ENV_FILE", File.join(workspace, "once-campfire-rust/parity/.env.reference")),
   output: File.join(work, "results"), cpus: "8-11", client_cpus: "12-15", suites: "http", cable_clients: "100,500,1000", cable_tput_secs: 15, routes: "room_show,messages_page,sidebar,search,avatar,static_css,up,post_message" }
 OptionParser.new do |parser|
   options.each do |key, default|
@@ -28,7 +28,7 @@ OptionParser.new do |parser|
 end.parse!
 raise "use an even number of rounds" unless options[:rounds].positive? && options[:rounds].even?
 apps = options[:apps].split(",")
-raise "unknown app" unless (apps - %w[ruby django laravel express]).empty?
+raise "unknown app" unless (apps - %w[express rust]).empty?
 labels = JSON.parse(File.read(File.join(options[:seed], "labels.json")))
 original_seed_sha = Digest::SHA256.file(File.join(options[:seed], "db/production.sqlite3")).hexdigest
 room = Integer(labels.fetch("rooms.watercooler"))
@@ -46,25 +46,15 @@ lg = ->(*args) do
   end
 end
 container = "cf-native-bench-#{Process.pid}"
-redis_container = "#{container}-redis"
-redis_port = options[:port] + 2
 results = []
 expected_message_ids = {}
 metadata = { started_at: Time.now.utc.iso8601, seed_sha256: original_seed_sha, server_cpus: options[:cpus],
   client_cpus: options[:client_cpus], network: "host", gzip: true, duration: options[:duration],
   concurrencies: options[:concurrencies], rounds: options[:rounds], loadgen_sha256: Digest::SHA256.file(options[:loadgen]).hexdigest,
   suites: options[:suites], routes: options[:routes], cable_clients: options[:cable_clients], cable_tput_secs: options[:cable_tput_secs], images: {}, image_labels: {}, source_revisions: {}, preflight_only: options[:preflight] }
-observer_app = nil
 sql = ->(db, query) do
   readonly = query.match?(/\A(?:SELECT|PRAGMA)/i)
-  output = if readonly && observer_app == "laravel"
-    # The FPM-owned WAL can create its shared-memory file even for a read-only observer.
-    # Read as that same UID inside the disposable container, without booting Laravel.
-    run("docker", "exec", "--user", "www-data", container, "php", "-r",
-      '$pdo = new PDO("sqlite:/rails/storage/db/production.sqlite3"); $pdo->exec("PRAGMA busy_timeout = 10000"); echo json_encode($pdo->query($argv[1])->fetchAll(PDO::FETCH_ASSOC));', query)
-  else
-    run("sqlite3", "-cmd", ".timeout 10000", *(readonly ? ["-readonly"] : []), "-json", db, query)
-  end
+  output = run("sqlite3", "-cmd", ".timeout 10000", *(readonly ? ["-readonly"] : []), "-json", db, query)
   output.strip.empty? ? [] : JSON.parse(output)
 end
 check_sample = ->(name, value) do
@@ -74,8 +64,8 @@ begin
   options[:rounds].times do |iteration|
     order = iteration.even? ? apps : apps.reverse
     order.each do |app|
-      image = ENV.fetch("#{app.upcase}_IMAGE", app == "ruby" ? "campfire-ruby:readme-659f957" : "once-campfire-#{app}:app")
-      source = File.join(workspace, "once-campfire#{app == 'ruby' ? '' : "-#{app}"}")
+      image = ENV.fetch("#{app.upcase}_IMAGE", app == "rust" ? "campfire-rust:app" : "once-campfire-#{app}:app")
+      source = File.join(workspace, "once-campfire-#{app}")
       metadata[:images][app] = run("docker", "image", "inspect", "-f", "{{.Id}}", image).strip
       metadata[:image_labels][app] = JSON.parse(run("docker", "image", "inspect", "-f", "{{json .Config.Labels}}", image))
       metadata[:source_revisions][app] = { head: run("git", "-C", source, "rev-parse", "HEAD").strip,
@@ -91,18 +81,11 @@ begin
       config = fixture_env.merge("WEB_CONCURRENCY" => "3", "JOB_CONCURRENCY" => "3", "RAILS_MAX_THREADS" => "5",
         "RAILS_LOG_LEVEL" => "warn", "HTTP_PORT" => options[:port].to_s, "TARGET_PORT" => (options[:port] + 1).to_s)
       config.merge!(JSON.parse(ENV.fetch("#{app.upcase}_BENCH_ENV", "{}")))
-      if app == "django"
-        redis_image = ENV.fetch("DJANGO_REDIS_IMAGE", "redis:7.2-alpine")
-        metadata[:images]["django_redis"] = run("docker", "image", "inspect", "-f", "{{.Id}}", redis_image).strip
-        run("docker", "run", "-d", "--name", redis_container, "--network", "host", "--cpuset-cpus", options[:cpus], redis_image,
-          "redis-server", "--bind", "127.0.0.1", "--port", redis_port.to_s, "--save", "", "--appendonly", "no")
-        config["REDIS_URL"] = "redis://127.0.0.1:#{redis_port}/0"
-        config["WEB_WORKERS"] ||= "3"
-      end
-      metadata[:topology] ||= {}
-      metadata[:topology][app] = app == "express" ? {http_workers: config.fetch("WEB_WORKERS", "3"), cable: "native ws with cluster IPC", jobs: "leased auxiliary SQLite"} : app == "django" ? {http_workers: config.fetch("WEB_WORKERS"), cable: "ASGI with isolated Redis", jobs: "leased auxiliary SQLite"} :
-        app == "laravel" ? {http_workers: 8, http: "nginx/FPM OPcache", cable: "native Workerman", jobs: "auxiliary SQLite queue worker"} : {http_workers: 3, threads: 5, http: "Thruster/Puma", cable: "native Rails", jobs: "native Ruby Redis"}
       config["WEB_WORKERS"] ||= "3" if app == "express"
+      metadata[:topology] ||= {}
+      # The Rust port is one process: RAILS_MAX_THREADS sizes its reader pool, JOB_CONCURRENCY its job workers.
+      metadata[:topology][app] = app == "express" ? {http_workers: config.fetch("WEB_WORKERS"), cable: "native ws with cluster IPC", jobs: "leased auxiliary SQLite"} :
+        {processes: 1, readers: config.fetch("RAILS_MAX_THREADS"), job_workers: config.fetch("JOB_CONCURRENCY"), cable: "native tokio", jobs: "in-process"}
       command = ["docker", "run", "-d", "--name", container, "--network", "host", "--cpuset-cpus", options[:cpus]]
       command.concat environment(config)
       command.concat mounts(File.join(data, "db") => "/rails/storage/db", File.join(data, "files") => "/rails/storage/files", File.join(data, "logs") => "/rails/storage/logs")
@@ -114,12 +97,11 @@ begin
         raise "#{app} failed to start; inspect #{container} logs" if clock > deadline
         sleep 0.1
       end
-      observer_app = app
       sleep 10 unless options[:preflight]
       cookie = lg.call("login", "--base", base, "--email", labels.fetch("emails.david"), "--password", labels.fetch("passwords.all")).fetch("cookie")
       scrape = lg.call("scrape", "--base", base, "--cookie", cookie, "--room", room.to_s)
-      csrf = scrape.fetch("csrf")
-      raise "no CSRF token" unless csrf && !csrf.empty?
+      # Only Rails renders a CSRF token; both ports check Sec-Fetch-Site, which the load generator sends.
+      csrf = scrape.fetch("csrf").to_s
       routes = { "room_show" => "/rooms/#{room}", "messages_page" => "/rooms/#{room}/messages?before=#{labels.fetch('messages.busy_060')}",
         "sidebar" => "/users/me/sidebar", "search" => "/searches?q=coffee", "avatar" => "/users/#{labels.fetch('avatar_tokens.jason')}/avatar",
         "static_css" => scrape.fetch("css"), "up" => "/up", "post_message" => nil }
@@ -196,8 +178,6 @@ begin
       results << row
       write_json(File.join(options[:output], "#{app}-#{iteration + 1}.json"), row)
       remove_container(container)
-      observer_app = nil
-      remove_container(redis_container)
     end
   end
   raise "original seed changed" unless Digest::SHA256.file(File.join(options[:seed], "db/production.sqlite3")).hexdigest == original_seed_sha
@@ -213,5 +193,4 @@ begin
   puts JSON.pretty_generate(summary)
 ensure
   remove_container(container)
-  remove_container(redis_container)
 end

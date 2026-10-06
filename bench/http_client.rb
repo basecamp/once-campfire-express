@@ -18,8 +18,7 @@ class BenchmarkHTTPClient
       response = http.get("/session/new", "Accept-Encoding" => "identity")
       raise "sign-in page: HTTP #{response.code}" unless response.code == "200"
       merge_cookies(cookies, response)
-      token = response.body[/<meta name="csrf-token" content="([^"]*)"/, 1]
-      raise "sign-in page has no CSRF token" unless token
+      token = response.body[/<meta name="csrf-token" content="([^"]*)"/, 1].to_s
       request = Net::HTTP::Post.new("/session")
       request["Cookie"] = cookie_header(cookies)
       request["Origin"] = @base.to_s
