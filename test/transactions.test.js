@@ -38,14 +38,17 @@ test("Nested post-commit work runs only after durable outer commit and disappear
   });
   assert.deepEqual(observed, ["Committed"]);
 });
-test("Integers read back as numbers; values beyond 2^53 lose precision", () => {
+test("Integers read back as numbers; values beyond 2^53 throw on Node and round on Bun", () => {
   run("CREATE TABLE IF NOT EXISTS big(v INTEGER)");
   run("INSERT INTO big VALUES(?)", 2 ** 53 - 1);
   assert.equal(get("SELECT v FROM big").v, 2 ** 53 - 1);
   run("DELETE FROM big");
   run("INSERT INTO big VALUES(?)", 9007199254740993n);
-  // safeIntegers:false trades exactness above 2^53 for the native number fast path.
-  assert.equal(get("SELECT v FROM big").v, 9007199254740992);
+  if (globalThis.Bun)
+    // safeIntegers:false trades exactness above 2^53 for the native number fast path.
+    assert.equal(get("SELECT v FROM big").v, 9007199254740992);
+  else
+    assert.throws(() => get("SELECT v FROM big"), { code: "ERR_OUT_OF_RANGE" });
   run("DROP TABLE big");
 });
 test("SQLite adapter opens read-only databases and writes consistent backups", () => {
@@ -113,7 +116,8 @@ test("getCached equals get, counts hits and returns copies", async () => {
   clearQueryCache();
   const sql = "SELECT * FROM accounts ORDER BY id LIMIT 1";
   const first = getCached(sql);
-  assert.deepEqual(first, get(sql));
+  // node:sqlite rows have a null prototype; the cache hands out plain copies.
+  assert.deepEqual(first, { ...get(sql) });
   const before = queryCacheStats();
   const second = getCached(sql);
   assert.equal(queryCacheStats().hits, before.hits + 1);
@@ -192,8 +196,11 @@ test("negative results are cached and invalidated by inserts", async () => {
 test("background checkpoints keep the WAL bounded without autocheckpoint", async () => {
   const { checkpoint, walBytes, startCheckpointer } =
     await import("../src/checkpoint.js");
-  const { applyDurabilityPragmas, deferCheckpoints, BACKSTOP_AUTOCHECKPOINT_PAGES } =
-    await import("../src/db.js");
+  const {
+    applyDurabilityPragmas,
+    deferCheckpoints,
+    BACKSTOP_AUTOCHECKPOINT_PAGES,
+  } = await import("../src/db.js");
   const dir = mkdtempSync(join(tmpdir(), "campfire-wal-"));
   const path = join(dir, "w.sqlite3");
   const writer = openDatabase(path);
@@ -226,13 +233,65 @@ test("background checkpoints keep the WAL bounded without autocheckpoint", async
       assert.equal(result.busy, 0);
     }
     // Without checkpoints ten bursts would leave the WAL ~10x one burst.
-    assert.ok(largest <= single * 1.25, `WAL grew to ${largest} (one burst ${single})`);
+    assert.ok(
+      largest <= single * 1.25,
+      `WAL grew to ${largest} (one burst ${single})`,
+    );
     assert.equal(checkpoint(writer, path, 0).busy, 0);
     deferCheckpoints(writer);
     assert.equal(
       writer.prepare("PRAGMA wal_autocheckpoint").get().wal_autocheckpoint,
       BACKSTOP_AUTOCHECKPOINT_PAGES,
     );
+  } finally {
+    await checkpointer.stop();
+    writer.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+test("WEB_WORKERS parses auto, numbers and rejects invalid values", async () => {
+  const { parseWebWorkers } = await import("../src/workers.js");
+  assert.equal(parseWebWorkers(undefined, 4), 4);
+  assert.equal(parseWebWorkers("auto", 4), 4);
+  assert.equal(parseWebWorkers("auto", 0), 1);
+  assert.equal(parseWebWorkers("auto", 200), 64);
+  assert.equal(parseWebWorkers("2", 4), 2);
+  for (const bad of ["0", "65", "1.5", "abc", "-1"])
+    assert.throws(() => parseWebWorkers(bad, 4), /WEB_WORKERS/, bad);
+});
+
+test("WAL stays bounded with autocheckpoint disabled and the checkpoint thread running", async () => {
+  const { startCheckpointer, walBytes } = await import("../src/checkpoint.js");
+  const { applyDurabilityPragmas, deferCheckpoints } =
+    await import("../src/db.js");
+  const dir = mkdtempSync(join(tmpdir(), "campfire-wal-bound-"));
+  const path = join(dir, "bound.sqlite3");
+  const writer = openDatabase(path);
+  applyDurabilityPragmas(writer);
+  writer.exec("PRAGMA busy_timeout=10000");
+  deferCheckpoints(writer, 0);
+  writer.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)");
+  assert.equal(
+    writer.prepare("PRAGMA wal_autocheckpoint").get().wal_autocheckpoint,
+    0,
+  );
+  const checkpointer = startCheckpointer(path, {
+    interval: 20,
+    limit: 256 * 1024,
+    maxLimit: 1024 * 1024,
+  });
+  try {
+    const body = "x".repeat(2000);
+    let largest = 0;
+    for (let round = 0; round < 40; round++) {
+      for (let i = 0; i < 50; i++)
+        writer.prepare("INSERT INTO t (body) VALUES (?)").run(body);
+      largest = Math.max(largest, walBytes(path));
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+    // 2000 rows of 2 KB written would be ~4 MB of WAL uncheckpointed.
+    assert.ok(largest < 3 * 1024 * 1024, `WAL reached ${largest}`);
+    assert.equal(writer.prepare("SELECT COUNT(*) n FROM t").get().n, 2000);
   } finally {
     await checkpointer.stop();
     writer.close();

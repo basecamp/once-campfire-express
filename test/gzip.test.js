@@ -4,7 +4,7 @@ import zlib from "node:zlib";
 import http from "node:http";
 process.env.DATABASE_PATH = ":memory:";
 process.env.SECRET_KEY_BASE = "spliced-gzip-tests-".repeat(8);
-const { SplicedGzip, gzipSpliced, splicedGzipCache } =
+const { SplicedGzip, gzipSpliced, splicedGzipCache, fastEtag } =
   await import("../src/gzip.js");
 const { run, get, now, initialize } = await import("../src/db.js");
 const domain = await import("../src/domain.js");
@@ -311,8 +311,8 @@ test("e: room pages are served as spliced gzip through the real app", async () =
     assert.match(etag, /^W\/"/);
     assert.equal(
       etag,
-      createApp().get("etag fn")(Buffer.from(html, "utf8")),
-      "ETag is Express's over the uncompressed body",
+      fastEtag(Buffer.from(html, "utf8")),
+      "ETag is the fast weak ETag over the uncompressed body",
     );
 
     const viaFetch = await fetch(`http://127.0.0.1:${port}${path}`, {
@@ -395,7 +395,7 @@ test("the middleware keeps Express ETag, 304, HEAD and identity semantics", asyn
     assert.equal(zipped.response.headers["content-encoding"], "gzip");
     assertSingleMemberGzip(zipped.body, body);
     const etag = zipped.response.headers.etag;
-    assert.equal(etag, app.get("etag fn")(Buffer.from(body, "utf8")));
+    assert.equal(etag, fastEtag(Buffer.from(body, "utf8")));
 
     const plain = await raw(port, "/page");
     assert.equal(plain.response.headers["content-encoding"], undefined);
@@ -532,7 +532,7 @@ test("sendPage answers like res.send(string) through the middleware", async () =
     const bytes = Buffer.from(html, "utf8");
     return {
       bytes,
-      etag: app.get("etag fn")(bytes),
+      etag: fastEtag(bytes),
       gzip: () => gzipWhole(bytes),
     };
   };

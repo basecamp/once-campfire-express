@@ -15,6 +15,7 @@ const domain = await import("../src/domain.js");
 const rails = await import("../src/rails.js");
 const { createApp } = await import("../src/app.js");
 const { messageCacheKeys } = await import("../src/rendering.js");
+const { fastEtag } = await import("../src/gzip.js");
 const { ResponseCache, responseCache, sendCachedPage, budgetFromEnv } =
   await import("../src/response_cache.js");
 
@@ -144,7 +145,7 @@ test("a repeated room GET is a byte-identical hit in identity and gzip, equal to
   );
   assert.equal(
     second.result.response.headers.etag,
-    createApp().get("etag fn")(first.result.body),
+    fastEtag(first.result.body),
   );
 
   const zipped = await counted(() => page(path, { "accept-encoding": "gzip" }));
@@ -422,6 +423,46 @@ test("message cache keys see a body change that keeps updated_at", () => {
   run(
     "UPDATE action_text_rich_texts SET body=? WHERE record_type='Message' AND record_id=?",
     "<p>after</p>",
+    message.id,
+  );
+  assert.notEqual(messageCacheKeys([row])[0], first);
+});
+
+test("a cache miss encodes the rendered page to bytes once and answers 304 on the fast ETag", async () => {
+  const path = `/rooms/${open.id}`;
+  responseCache.clear?.();
+  const original = Buffer.from;
+  let pageEncodings = 0;
+  Buffer.from = function (value, ...rest) {
+    if (typeof value === "string" && value.length > 20000) pageEncodings++;
+    return original.call(this, value, ...rest);
+  };
+  let first;
+  try {
+    first = await counted(() => page(path, { "accept-encoding": "gzip" }));
+  } finally {
+    Buffer.from = original;
+  }
+  assert.equal(first.misses, 1);
+  assert.equal(pageEncodings, 1);
+  const etag = first.result.response.headers.etag;
+  assert.match(etag, /^W\/"[0-9a-f]+-[0-9a-f]+"$/);
+  const plain = await page(path);
+  assert.equal(plain.response.headers.etag, etag);
+  assert.equal(etag, fastEtag(plain.body));
+  const fresh = await page(path, { "if-none-match": etag });
+  assert.equal(fresh.response.statusCode, 304);
+  assert.equal(fresh.body.length, 0);
+});
+
+test("message cache keys are stable across calls and see same-length edits", () => {
+  const message = domain.createMessage(open.id, admin.id, "<p>aaaa</p>");
+  const row = domain.messageById(message.id);
+  const [first] = messageCacheKeys([row]);
+  assert.equal(messageCacheKeys([row])[0], first);
+  run(
+    "UPDATE action_text_rich_texts SET body=? WHERE record_type='Message' AND record_id=?",
+    "<p>bbbb</p>",
     message.id,
   );
   assert.notEqual(messageCacheKeys([row])[0], first);

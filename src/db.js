@@ -46,10 +46,15 @@ export function applyDurabilityPragmas(target) {
 }
 // 16384 pages (64 MB at 4 KB pages) is a backstop so the WAL stays bounded if the background checkpointer stalls.
 export const BACKSTOP_AUTOCHECKPOINT_PAGES = 16384;
-export function deferCheckpoints(target = db()) {
-  target.exec(`PRAGMA wal_autocheckpoint=${BACKSTOP_AUTOCHECKPOINT_PAGES}`);
+export function deferCheckpoints(
+  target = db(),
+  pages = BACKSTOP_AUTOCHECKPOINT_PAGES,
+) {
+  target.exec(`PRAGMA wal_autocheckpoint=${pages}`);
 }
-export const databaseFile = () => connection?.filename;
+// bun:sqlite exposes .filename, node:sqlite a location() method.
+export const databaseFile = () =>
+  connection && (connection.filename ?? connection.location());
 export function db() {
   return connection || initialize();
 }

@@ -24,8 +24,16 @@ export const roomForUser = (user, id) =>
     Number(user?.id ?? user),
     Number(id),
   );
-const presentation =
-  "SELECT m.*,u.name AS creator_name,u.bio AS creator_bio,u.updated_at AS creator_updated_at,r.name AS room_name,r.type AS room_type FROM messages m JOIN users u ON u.id=m.creator_id JOIN rooms r ON r.id=m.room_id";
+const presentationColumns =
+  "m.*,u.name AS creator_name,u.bio AS creator_bio,u.updated_at AS creator_updated_at,r.name AS room_name,r.type AS room_type";
+const presentationJoins =
+  "JOIN users u ON u.id=m.creator_id JOIN rooms r ON r.id=m.room_id";
+export const presentation = `SELECT ${presentationColumns} FROM messages m ${presentationJoins}`;
+// Pages the messages first and joins the 40 survivors. Equivalent to joining first because
+// messages.creator_id and room_id are NOT NULL foreign keys (foreign_keys=ON), so the inner
+// joins never drop a row.
+export const pagedPresentation = (clauses, direction) =>
+  `SELECT ${presentationColumns} FROM (SELECT * FROM messages WHERE ${clauses} ORDER BY created_at ${direction}, id ${direction} LIMIT 40) m ${presentationJoins} ORDER BY m.created_at ${direction}, m.id ${direction}`;
 export const messageById = (id) =>
   get(presentation + " WHERE m.id=?", Number(id));
 export function messagesByIds(ids) {
@@ -72,7 +80,7 @@ export function messagesForRoom(id, { before, after, around } = {}) {
       ),
     ];
   }
-  let clauses = " WHERE m.room_id=?",
+  let clauses = "room_id=?",
     args = [Number(id)];
   for (const [anchor, operator] of [
     [before, "<"],
@@ -86,15 +94,10 @@ export function messagesForRoom(id, { before, after, around } = {}) {
       );
       if (!pivot)
         throw Object.assign(new Error("Message not found"), { status: 404 });
-      clauses += ` AND m.created_at${operator}?`;
+      clauses += ` AND created_at${operator}?`;
       args.push(pivot.created_at);
     }
-  const rows = all(
-    presentation +
-      clauses +
-      ` ORDER BY m.created_at ${after ? "ASC" : "DESC"}, m.id ${after ? "ASC" : "DESC"} LIMIT 40`,
-    ...args,
-  );
+  const rows = all(pagedPresentation(clauses, after ? "ASC" : "DESC"), ...args);
   return after ? rows : rows.reverse();
 }
 export function grantMemberships(room, userIds) {

@@ -1,6 +1,7 @@
 # once-campfire-express
 
-ONCE Campfire implemented natively with Bun 1.4.2 (`bun:sqlite`) and Express 5. The existing SQLite
+ONCE Campfire implemented natively with Node.js 24 (`node:sqlite`) and Express 5; the same code
+also runs on Bun 1.4.2 (`bun:sqlite`, `Dockerfile.bun`). The existing SQLite
 schema, uploaded files, bcrypt passwords and Rails login cookies remain compatible.
 Eta templates (`templates/eta/`, converted byte for byte from the former nunjucks macros by
 `bin/nunjucks-to-eta.js`) render the retained Turbo/Stimulus/Lexxy frontend; native WebSockets
@@ -15,13 +16,13 @@ docker run --rm -p 8080:80 -e SECRET_KEY_BASE="$(openssl rand -hex 64)" \
 
 Existing installs must reuse their `SECRET_KEY_BASE` and mount their storage at
 `/rails/storage`. Preserve VAPID keys for existing push subscriptions. `WEB_WORKERS`
-sets the HTTP process count; publications pass through the primary process to every
-worker. A separate leased SQLite queue handles jobs. TLS terminates at a proxy;
-configure `TRUSTED_PROXIES` with its addresses.
+sets the HTTP process count (default `auto`: available CPUs, respecting cpusets);
+publications pass through the primary process to every worker. A separate leased SQLite
+queue handles jobs. TLS terminates at a proxy; configure `TRUSTED_PROXIES` with its addresses.
 
-For local development, install the pinned Bun (`.bun-version`), run `bun install`,
-`bun run build:assets`, set `SECRET_KEY_BASE`, then `bun run start`. Run `bun run test`
-(each test file in its own `bun test` process) for native integration and independent
+For local development, install the pinned Node (`.node-version`), run `npm ci`,
+`npm run build:assets`, set `SECRET_KEY_BASE`, then `npm start`. Run `npm test`
+(each test file in its own process; `bun run test:bun` runs the suite on Bun) for native integration and independent
 Rails golden-vector tests. The public Rails
 reference is immutable and pinned at `659f957`.
 
@@ -45,7 +46,19 @@ At 100 WebSocket connections and five messages/second, median delivery to every
 connection was 24 ms for Rails and 14 ms for Express. Every message reached every
 connection in both runs.
 
-The table predates the Bun runtime and the caching work below; it will be re-measured.
+The table above predates the caching work below. A later matched run on a 16-thread x86-64
+host (same harness, 16 clients, servers on 4 hardware threads) measured this branch:
+
+| HTTP workload (requests/sec) | Express on Node 24 | Express on Bun 1.4.2 | Rust |
+|---|---:|---:|---:|
+| Room page | 20,509 | 23,881 | 18,419 |
+| Messages page | 31,991 | 35,493 | 20,449 |
+| Sidebar | 35,548 | 41,802 | 17,923 |
+| Search | 35,233 | 41,134 | 17,960 |
+| Post a message | 1,386 | 1,501 | 4,097 |
+
+Reads hit the whole-page response cache because the read benchmark performs no concurrent
+writes; any committed write clears it, so mixed workloads read closer to uncached rendering.
 
 ## Known differences
 
@@ -63,8 +76,9 @@ The table predates the Bun runtime and the caching work below; it will be re-mea
   rebuilding previews as needed. Native-library media bytes can differ.
 - HTML whitespace and malformed-fragment repair can differ. Full byte parity is not claimed.
 - Direct-room autocomplete explicitly requests JSON, repairing the original fetch-header bug.
-- Runtime is Bun only. Integers above 2^53 read from SQLite are rounded by `bun:sqlite`
-  (safeIntegers off); the Campfire schema stores none.
+- Node 24 is the default runtime; Bun 1.4.2 is optional. Integers above 2^53 read from
+  SQLite throw on Node and are rounded by `bun:sqlite` (safeIntegers off); the Campfire
+  schema stores none. HTML ETag hash values differ between runtimes.
 - Eta templates replace nunjucks with byte-identical output (fuzz and snapshot checked,
   escaping identical including backslash). `push_subscriptions` with two or more
   subscriptions threw under nunjucks and now renders.
@@ -95,8 +109,11 @@ The table predates the Bun runtime and the caching work below; it will be re-mea
   through the primary (single writer). A hard crash between response and enqueue loses
   them; clean shutdown flushes. Jobs run in parallel up to `JOB_CONCURRENCY` (default 3),
   so completion order is not queue order. The jobs DB uses `synchronous=NORMAL`.
-- WAL checkpoints run on a background thread (`src/checkpoint.js`) in the primary every
-  second, truncating above 64 MB; every process keeps a 64 MB autocheckpoint backstop.
+- WAL checkpoints run on a background thread (`src/checkpoint.js`) in the primary: PASSIVE
+  every 250 ms, TRUNCATE above 64 MB, forced RESTART above `CAMPFIRE_WAL_MAX_MB` (256).
+  Cluster web workers disable WAL autocheckpoint; single-process mode keeps a 64 MB backstop.
+- `WEB_WORKERS` defaults to `auto`; cluster workers listen with `reusePort` on Linux
+  (`REUSE_PORT=0` disables). HTML ETags are `W/"<length>-<fast hash>"`.
 - Action Cable keeps a per-stream subscriber index. A revoked or dead socket is cut off on
   the next publish to one of its own streams, by `forgetUser` in the revoking worker, or by
   the 3 s ping.

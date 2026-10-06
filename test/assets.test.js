@@ -1,8 +1,8 @@
-import test, { before } from "node:test";
+import test, { before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import zlib from "node:zlib";
-import { createServer } from "node:http";
+import { createServer, get as httpGet } from "node:http";
 import { execFileSync } from "node:child_process";
 process.env.DATABASE_PATH = ":memory:";
 process.env.SECRET_KEY_BASE = "assets-tests";
@@ -19,12 +19,30 @@ before(async () => {
   server = createServer(createApp());
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   base = `http://127.0.0.1:${server.address().port}`;
-  return () => new Promise((r) => server.close(r));
 });
+after(() => {
+  server.closeAllConnections();
+  server.close();
+});
+// node:http instead of fetch: Node's fetch always decodes Content-Encoding, and the raw
+// precompressed bytes are what these tests check.
 const get = (url, encoding) =>
-  fetch(base + url, {
-    headers: encoding ? { "accept-encoding": encoding } : {},
-    decompress: false,
+  new Promise((resolve, reject) => {
+    const headers = encoding ? { "accept-encoding": encoding } : {};
+    httpGet(base + url, { headers }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("error", reject);
+      res.on("end", () => {
+        const body = Buffer.concat(chunks);
+        resolve({
+          status: res.statusCode,
+          headers: { get: (name) => res.headers[name] ?? null },
+          arrayBuffer: async () => body,
+          text: async () => body.toString("utf8"),
+        });
+      });
+    }).on("error", reject);
   });
 
 test("build writes gzip and brotli variants for compressible assets", () => {

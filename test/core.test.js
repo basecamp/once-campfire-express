@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 process.env.SECRET_KEY_BASE = "core-test-secret-".repeat(8);
 const temp = mkdtempSync(join(tmpdir(), "campfire-express-core-"));
 process.env.CAMPFIRE_STORAGE_PATH = temp;
@@ -751,11 +751,22 @@ async function httpSession(user, token) {
     auth,
     ...response.headers.getSetCookie().map((c) => c.split(";")[0]),
   ].join("; ");
-  const page = async (path, headers = {}) => {
-    const r = await fetch(base + path, { headers: { cookie, ...headers } });
-    assert.equal(r.status, 200, path);
-    return r.text();
-  };
+  // node:http, not fetch: Node's fetch drops a custom Host header.
+  const page = (path, headers = {}) =>
+    new Promise((resolve, reject) => {
+      httpRequest(base + path, { headers: { cookie, ...headers } }, (r) => {
+        r.setEncoding("utf8");
+        let body = "";
+        r.on("data", (chunk) => (body += chunk));
+        r.on("error", reject);
+        r.on("end", () => {
+          assert.equal(r.statusCode, 200, path);
+          resolve(body);
+        });
+      })
+        .on("error", reject)
+        .end();
+    });
   const post = (path, fields) =>
     fetch(base + path, {
       method: "POST",
@@ -897,8 +908,16 @@ test("messages page answers unchanged conditional requests with 304 before rende
   const { messageFragments } = await import("../src/rendering.js");
   const http = await httpSession(admin, "etag-session");
   const url = `http://${http.host}/rooms/${open.id}/messages`;
+  // Node's fetch adds Cache-Control: no-cache to conditional requests unless one is set,
+  // which makes Express treat them as never fresh; browsers revalidate with max-age=0.
   const get = (headers = {}) =>
-    fetch(url, { headers: { cookie: http.cookie, ...headers } });
+    fetch(url, {
+      headers: {
+        cookie: http.cookie,
+        "cache-control": "max-age=0",
+        ...headers,
+      },
+    });
   const fetchOriginal = messageFragments.fetch;
   let renders = 0;
   messageFragments.fetch = function (...args) {
@@ -936,4 +955,49 @@ test("messages page answers unchanged conditional requests with 304 before rende
     messageFragments.fetch = fetchOriginal;
     await http.close();
   }
+});
+
+test("messagesForRoom paging query returns exactly what the join-first query did", async () => {
+  const { presentation } = domain;
+  const room = open;
+  for (let i = 0; i < 95; i++)
+    domain.createMessage(
+      room.id,
+      i % 2 ? admin.id : member.id,
+      `<p>page ${i}</p>`,
+    );
+  const ids = all(
+    "SELECT id FROM messages WHERE room_id=? ORDER BY created_at,id",
+    room.id,
+  ).map((r) => r.id);
+  const created = (id) =>
+    get("SELECT created_at FROM messages WHERE id=?", id).created_at;
+  const legacy = (clauses, args, direction) => {
+    const rows = all(
+      `${presentation} WHERE m.room_id=?${clauses} ORDER BY m.created_at ${direction}, m.id ${direction} LIMIT 40`,
+      room.id,
+      ...args,
+    );
+    return direction === "ASC" ? rows : rows.reverse();
+  };
+  const pivot = ids[50];
+  assert.deepEqual(domain.messagesForRoom(room.id), legacy("", [], "DESC"));
+  assert.deepEqual(
+    domain.messagesForRoom(room.id, { before: pivot }),
+    legacy(" AND m.created_at<?", [created(pivot)], "DESC"),
+  );
+  assert.deepEqual(
+    domain.messagesForRoom(room.id, { after: pivot }),
+    legacy(" AND m.created_at>?", [created(pivot)], "ASC"),
+  );
+  assert.equal(domain.messagesForRoom(room.id).length, 40);
+});
+
+test("fastEtag is stable per body, weak, and differs between bodies", async () => {
+  const { fastEtag } = await import("../src/gzip.js");
+  const a = Buffer.from("<p>one</p>".repeat(200));
+  const b = Buffer.from("<p>two</p>".repeat(200));
+  assert.match(fastEtag(a), /^W\/"[0-9a-f]+-[0-9a-f]+"$/);
+  assert.equal(fastEtag(a), fastEtag(Buffer.from(a)));
+  assert.notEqual(fastEtag(a), fastEtag(b));
 });

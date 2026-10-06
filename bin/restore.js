@@ -69,6 +69,6 @@ export function restoreBackup(
 }
 if (process.argv[1] === new URL(import.meta.url).pathname) {
   if (!process.argv[2])
-    throw new Error("Usage: bun bin/restore.js INPUT.tar.gz");
+    throw new Error("Usage: node bin/restore.js INPUT.tar.gz");
   console.log(restoreBackup(process.argv[2]));
 }

@@ -118,6 +118,10 @@ function split(bytes, needles) {
   }
 }
 
+const pieceHash = globalThis.Bun
+  ? (bytes, seed) => Bun.hash(bytes, seed)
+  : (bytes, seed) => zlib.crc32(bytes, Number(seed & 0xffffffffn));
+
 export class SplicedGzip {
   #entries = new Map();
   #texts = new Map();
@@ -132,8 +136,10 @@ export class SplicedGzip {
     this.maxEntry = Math.floor(budget / 8);
   }
 
+  // Only picks candidates; #find confirms with Buffer.equals, so a crc32 collision on Node
+  // costs a comparison, never a wrong piece.
   hash(bytes) {
-    return Bun.hash(bytes, this.#seed);
+    return pieceHash(bytes, this.#seed);
   }
 
   stats() {
@@ -341,6 +347,16 @@ export function gzipWhole(bytes) {
 
 export const htmlType = withUtf8Charset("text/html; charset=utf-8");
 
+const bodyHash =
+  typeof Bun !== "undefined" && typeof Bun.hash === "function"
+    ? (bytes) => Bun.hash(bytes).toString(16)
+    : (bytes) => zlib.crc32(bytes).toString(16);
+
+// Weak validator for pages we render ourselves. Only has to be stable per body, so a fast
+// non-cryptographic hash replaces Express's SHA-1; the length makes collisions far less likely.
+export const fastEtag = (bytes) =>
+  `W/"${bytes.length.toString(16)}-${bodyHash(bytes)}"`;
+
 // Sends an already rendered 200 HTML page ({ bytes, etag, gzip() }) with the headers, ETag,
 // freshness and encoding res.type("html").send(string) produces through splicedGzip(), but
 // without re-encoding, re-hashing or re-compressing the body.
@@ -364,18 +380,16 @@ export function sendPage(req, res, page) {
 
 // Installed before compression(): it answers large 200 text/html string bodies itself and
 // sets Content-Encoding, which makes compression() pass them through untouched. ETag and
-// freshness follow res.send exactly, over the uncompressed body. HEAD is left to Express.
+// freshness follow res.send exactly, over the uncompressed body. HEAD gets the same ETag, uncompressed.
 export function splicedGzip(cache = splicedGzipCache) {
   return (req, res, next) => {
-    if (req.method !== "GET") return next();
+    if (req.method !== "GET" && req.method !== "HEAD") return next();
     const send = res.send;
     res.send = function (body) {
       if (
         typeof body !== "string" ||
         this.statusCode !== 200 ||
-        this.get("Content-Encoding") ||
-        noTransform.test(this.get("Cache-Control") || "") ||
-        !req.acceptsEncodings("gzip")
+        this.get("Content-Encoding")
       )
         return send.call(this, body);
       if (!this.get("Content-Type")) this.type("html");
@@ -383,14 +397,17 @@ export function splicedGzip(cache = splicedGzipCache) {
       if (typeof type !== "string" || !/^text\/html\b/i.test(type))
         return send.call(this, body);
       const bytes = Buffer.from(body, "utf8");
-      if (bytes.length < 1024) return send.call(this, body);
       this.set("Content-Type", withUtf8Charset(type));
-      const etagFn = req.app.get("etag fn");
-      if (!this.get("ETag") && typeof etagFn === "function") {
-        const etag = etagFn(bytes);
-        if (etag) this.set("ETag", etag);
-      }
-      if (req.fresh) return send.call(this, bytes);
+      if (!this.get("ETag") && req.app.enabled("etag"))
+        this.set("ETag", fastEtag(bytes));
+      if (
+        req.method === "HEAD" ||
+        bytes.length < 1024 ||
+        req.fresh ||
+        noTransform.test(this.get("Cache-Control") || "") ||
+        !req.acceptsEncodings("gzip")
+      )
+        return send.call(this, bytes);
       this.vary("Accept-Encoding");
       this.set("Content-Encoding", "gzip");
       return send.call(this, cache.gzip(bytes));

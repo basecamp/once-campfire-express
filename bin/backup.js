@@ -62,6 +62,6 @@ export async function createBackup(
 }
 if (process.argv[1] === new URL(import.meta.url).pathname) {
   if (!process.argv[2])
-    throw new Error("Usage: bun bin/backup.js OUTPUT.tar.gz");
+    throw new Error("Usage: node bin/backup.js OUTPUT.tar.gz");
   console.log(await createBackup(process.argv[2]));
 }

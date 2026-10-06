@@ -1,5 +1,5 @@
 import { db, writeEpoch } from "./db.js";
-import { gzipWhole, sendPage } from "./gzip.js";
+import { fastEtag, gzipWhole, sendPage } from "./gzip.js";
 
 const OVERHEAD = 256;
 
@@ -217,11 +217,9 @@ export function sendCachedPage(req, res, tag, produce, cache = responseCache) {
   const html = produce();
   if (html === undefined) return;
   const bytes = Buffer.from(html, "utf8");
-  const etagFn = req.app.get("etag fn");
   const page = new Page(
     bytes,
-    res.get("ETag") ||
-      (typeof etagFn === "function" ? etagFn(bytes) : undefined),
+    res.get("ETag") || (req.app.enabled("etag") ? fastEtag(bytes) : undefined),
   );
   if (
     res.statusCode === 200 &&

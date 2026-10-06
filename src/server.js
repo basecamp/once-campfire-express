@@ -1,6 +1,7 @@
 import cluster from "node:cluster";
 import http from "node:http";
-import { initialize, deferCheckpoints, databaseFile } from "./db.js";
+import { initialize, deferCheckpoints, databaseFile, db } from "./db.js";
+import { parseWebWorkers } from "./workers.js";
 import { createApp } from "./app.js";
 import { attachCable } from "./cable.js";
 import {
@@ -13,13 +14,12 @@ import {
 import { startCheckpointer } from "./checkpoint.js";
 
 let shuttingDown = false;
-const workers = Number(process.env.WEB_WORKERS || "1");
-if (!Number.isInteger(workers) || workers < 1 || workers > 64)
-  throw new Error("WEB_WORKERS must be between 1 and 64");
+const workers = parseWebWorkers();
 const serves = workers === 1 || cluster.isWorker;
 
 initialize();
-deferCheckpoints();
+// Cluster workers never checkpoint: the primary's checkpointer thread owns that, so request commits skip it.
+deferCheckpoints(db(), cluster.isWorker ? 0 : undefined);
 let checkpointer, server;
 if (cluster.isPrimary) {
   const file = databaseFile();
@@ -43,14 +43,34 @@ if (cluster.isPrimary) {
 if (serves) {
   server = http.createServer(createApp());
   attachCable(server);
-  server.listen(
-    Number(process.env.HTTP_PORT || 8080),
-    process.env.BIND || "0.0.0.0",
-    () =>
-      console.log(
-        `Campfire Express listening on ${process.env.HTTP_PORT || 8080}`,
-      ),
-  );
+  listen();
+}
+
+function listen() {
+  const port = Number(process.env.HTTP_PORT || 8080);
+  const host = process.env.BIND || "0.0.0.0";
+  const announce = () => console.log(`Campfire Express listening on ${port}`);
+  const reusePort =
+    cluster.isWorker &&
+    process.platform === "linux" &&
+    process.env.REUSE_PORT !== "0";
+  if (!reusePort) return server.listen(port, host, announce);
+  const fallback = (error) => {
+    console.error(
+      `reusePort listen failed (${error.code || error.message}); using shared listen`,
+    );
+    server.listen(port, host, announce);
+  };
+  server.once("error", fallback);
+  try {
+    server.listen({ port, host, reusePort: true, exclusive: true }, () => {
+      server.off("error", fallback);
+      announce();
+    });
+  } catch (error) {
+    server.off("error", fallback);
+    fallback(error);
+  }
 }
 
 function closeServer() {

@@ -22,9 +22,8 @@ unverified; native transports reject private destinations and pin resolved addre
 Malformed/legacy rich text outside the independent corpus can differ. Unsupported
 older SQLite schemas require migration by the original application before upgrade.
 
-The Bun 1.4.2 / Eta branch (`bun-runtime`) is not yet frozen or benchmarked; the figures
-below and the README table describe the earlier frozen runtime `124694f` (Node 24.21.0 /
-Express 5.2.1) and are not evidence for the Bun branch. All 52
+The figures below describe the earlier frozen runtime `124694f` (Node 24.21.0 / Express
+5.2.1); README.md lists a later matched run of the caching branch on Node and Bun. All 52
 native methods pass without seed skips. Independent checks passed 26 browser
 assertions without JavaScript errors, 18 HTTP/session checks, 11 request boundaries,
 6 crafted room-namespace checks, 4 real multi-tab presence checks and 3 socket
@@ -37,10 +36,11 @@ The unchanged common load generator and original seed hashes are recorded in ign
 scratch evidence. Benchmark orchestration is Ruby, and server processes share four
 hardware threads; Express uses three HTTP workers and its primary job/fanout process.
 
-## Bun runtime, templates and caches: known differences
+## Runtimes, templates and caches: known differences
 
-Runtime is Bun 1.4.2 only (`.bun-version`, `oven/bun:1.4.2-debian`, `engines`); SQLite is
-`bun:sqlite` (`src/sqlite.js`). Unit tests alone do not establish production parity; the
+Node 24 is the default runtime (`.node-version`, `Dockerfile`); Bun 1.4.2 is optional
+(`.bun-version`, `Dockerfile.bun`). `src/sqlite.js` selects `node:sqlite` or `bun:sqlite`
+once at load; `src/gzip.js` hashes with `Bun.hash` on Bun and `zlib.crc32` on Node. Unit tests alone do not establish production parity; the
 branch needs fresh production Docker checks and re-measured benchmarks.
 
 - Templates: Eta 4.6.0, one `templates/eta/*.eta` per former nunjucks macro, converted
@@ -62,8 +62,14 @@ branch needs fresh production Docker checks and re-measured benchmarks.
 - Messages page answers 304 via ETag from the fragment keys (Rails `fresh_when @messages`).
 - Action Cable authorization memo `CABLE_AUTH_TTL_MS` (default 1000): revocation is
   immediate in the worker that performs it (`forgetUser`), within the TTL elsewhere.
-- Integers above 2^53 read from SQLite are rounded by `bun:sqlite` (safeIntegers off);
-  Campfire's schema stores none.
+- Integers above 2^53 read from SQLite throw on Node and are rounded by `bun:sqlite`
+  (safeIntegers off); Campfire's schema stores none.
+- `WEB_WORKERS` defaults to `auto` (`os.availableParallelism()`, respecting cpusets). Cluster
+  workers listen with `reusePort` on Linux (`REUSE_PORT=0` disables).
+- HTML ETags are `W/"<length>-<fast hash>"`; values differ between runtimes. The message
+  body digest memo keys on `updated_at`, length and a head/tail sample, so a same-millisecond
+  edit with identical length, head and tail can serve stale cached HTML (Rails keys on
+  `updated_at` alone).
 - CSRF: `Sec-Fetch-Site` replaces tokens. Writes accept `same-origin` and `same-site`,
   reject `cross-site`, `none` and missing headers over HTTPS with 422, and retain the
   `Origin` check. Plain HTTP accepts missing headers with `SameSite=Lax` cookies. Pages omit
@@ -88,8 +94,9 @@ branch needs fresh production Docker checks and re-measured benchmarks.
   through the primary (single writer). A hard crash between response and enqueue loses
   them; clean shutdown flushes. Jobs run in parallel up to `JOB_CONCURRENCY` (default 3),
   so completion order is not queue order. The jobs DB uses `synchronous=NORMAL`.
-- WAL checkpoints run on a background thread (`src/checkpoint.js`) in the primary every
-  second, truncating above 64 MB; every process keeps a 64 MB autocheckpoint backstop.
+- WAL checkpoints run on a background thread (`src/checkpoint.js`) in the primary: PASSIVE
+  every 250 ms, TRUNCATE above 64 MB, forced RESTART above `CAMPFIRE_WAL_MAX_MB` (256).
+  Cluster web workers disable WAL autocheckpoint; single-process mode keeps a 64 MB backstop.
 - Action Cable keeps a per-stream subscriber index. A revoked or dead socket is cut off on
   the next publish to one of its own streams, by `forgetUser` in the revoking worker, or by
   the 3 s ping.

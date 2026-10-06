@@ -207,45 +207,77 @@ const templateDigest = templateSources
   .digest("hex")
   .slice(0, 12);
 
-// SHA-1 of message bodies by rich-text id. A hit also requires the same updated_at and an equal
-// body, so a same-millisecond edit can never reuse a stale digest.
+// SHA-1 of message bodies by rich-text id. A hit needs the same updated_at, body length and body
+// head/tail sample, all selected without reading the body itself; a same-millisecond edit that
+// keeps length, head and tail is the one case this cannot tell apart from no edit.
 const bodyDigests = new Map();
-const BODY_DIGEST_BUDGET = 16 * 1024 * 1024;
-let bodyDigestBytes = 0;
-function bodyDigest(id, updatedAt, body) {
-  if (id == null) return createHash("sha1").update("").digest("base64");
-  const known = bodyDigests.get(id);
-  if (known && known.updatedAt === updatedAt && known.body === body)
-    return known.digest;
-  const digest = createHash("sha1").update(body).digest("base64");
-  if (known) bodyDigestBytes -= known.body.length * 2;
-  bodyDigests.delete(id);
-  bodyDigests.set(id, { updatedAt, body, digest });
-  bodyDigestBytes += body.length * 2;
-  for (const [oldId, old] of bodyDigests) {
-    if (bodyDigestBytes <= BODY_DIGEST_BUDGET) break;
-    bodyDigests.delete(oldId);
-    bodyDigestBytes -= old.body.length * 2;
-  }
-  return digest;
+const BODY_DIGEST_ENTRIES = 50_000;
+const EMPTY_DIGEST = createHash("sha1").update("").digest("base64");
+const sha1 = (body) => createHash("sha1").update(body).digest("base64");
+
+function memoisedDigest(row) {
+  const known = bodyDigests.get(row.rich_id);
+  return known &&
+    known.updatedAt === row.rich_updated_at &&
+    known.length === row.body_length &&
+    known.edges === row.body_edges
+    ? known.digest
+    : undefined;
 }
+
+function memoiseDigest(row, digest) {
+  bodyDigests.delete(row.rich_id);
+  bodyDigests.set(row.rich_id, {
+    updatedAt: row.rich_updated_at,
+    length: row.body_length,
+    edges: row.body_edges,
+    digest,
+  });
+  if (bodyDigests.size > BODY_DIGEST_ENTRIES)
+    bodyDigests.delete(bodyDigests.keys().next().value);
+}
+
+const placeholders = (n) => Array(n).fill("?").join(",");
 
 export function messageCacheKeys(rows, origin = "") {
   if (!rows.length) return [];
-  const ids = JSON.stringify(rows.map((m) => m.id));
+  const ids = rows.map((m) => m.id);
+  const marks = placeholders(ids.length);
+  const versionRows = all(
+    `SELECT m.id,r.id AS rich_id,r.updated_at AS rich_updated_at,length(r.body) AS body_length,substr(r.body,1,32)||substr(r.body,-32) AS body_edges,a.blob_id FROM messages m LEFT JOIN action_text_rich_texts r ON r.record_type='Message' AND r.name='body' AND r.record_id=m.id LEFT JOIN active_storage_attachments a ON a.record_type='Message' AND a.name='attachment' AND a.record_id=m.id WHERE m.id IN (${marks})`,
+    ...ids,
+  );
+  const digests = new Map();
+  const missed = [];
+  for (const r of versionRows) {
+    if (r.rich_id == null) continue;
+    const digest = memoisedDigest(r);
+    if (digest === undefined) missed.push(r);
+    else digests.set(r.rich_id, digest);
+  }
+  if (missed.length) {
+    const bodies = new Map(
+      all(
+        `SELECT id,body FROM action_text_rich_texts WHERE id IN (${placeholders(missed.length)})`,
+        ...missed.map((r) => r.rich_id),
+      ).map((r) => [r.id, r.body]),
+    );
+    for (const r of missed) {
+      const digest = sha1(bodies.get(r.rich_id) || "");
+      memoiseDigest(r, digest);
+      digests.set(r.rich_id, digest);
+    }
+  }
   const contentVersions = new Map(
-    all(
-      `SELECT j.value AS id,r.id AS rich_id,r.updated_at AS rich_updated_at,r.body,a.blob_id FROM json_each(?) j LEFT JOIN action_text_rich_texts r ON r.record_type='Message' AND r.name='body' AND r.record_id=j.value LEFT JOIN active_storage_attachments a ON a.record_type='Message' AND a.name='attachment' AND a.record_id=j.value`,
-      ids,
-    ).map((r) => [
+    versionRows.map((r) => [
       r.id,
-      `${bodyDigest(r.rich_id, r.rich_updated_at, r.body || "")}-${r.blob_id ?? ""}`,
+      `${r.rich_id == null ? EMPTY_DIGEST : digests.get(r.rich_id)}-${r.blob_id ?? ""}`,
     ]),
   );
   const boostVersions = new Map();
   for (const b of all(
-    `SELECT b.message_id,b.id,b.updated_at,u.name,u.updated_at AS booster_updated_at FROM boosts b JOIN users u ON u.id=b.booster_id WHERE b.message_id IN (SELECT value FROM json_each(?)) ORDER BY b.created_at`,
-    ids,
+    `SELECT b.message_id,b.id,b.updated_at,u.name,u.updated_at AS booster_updated_at FROM boosts b JOIN users u ON u.id=b.booster_id WHERE b.message_id IN (${marks}) ORDER BY b.created_at`,
+    ...ids,
   ))
     boostVersions.set(
       b.message_id,
