@@ -1,19 +1,55 @@
-import nunjucks from "nunjucks";
-import { readFileSync, existsSync } from "node:fs";
+import { Eta } from "eta";
+import { createHash } from "node:crypto";
+import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { all, get } from "./db.js";
 import * as rails from "./rails.js";
 import { escape, plainText, renderBody } from "./richtext.js";
 import { blobUrl, representationUrl } from "./storage.js";
-const env = new nunjucks.Environment(
-  new nunjucks.FileSystemLoader(
-    new URL("../templates/", import.meta.url).pathname,
-  ),
-  { autoescape: true },
-);
-const safe = (value) => new nunjucks.runtime.SafeString(value || "");
+import { FragmentCache } from "./fragment_cache.js";
+// Output keeps nunjucks autoescape semantics byte for byte: null and undefined print nothing,
+// SafeString values print verbatim, and everything else is stringified and escaped with the
+// nunjucks table, which unlike Eta's default also escapes backslash. The check is per value at
+// runtime, so data such as message HTML stays unescaped wherever it is printed.
+class SafeString {
+  constructor(value) {
+    this.val = value;
+  }
+  toString() {
+    return this.val;
+  }
+}
+export const safe = (value) => new SafeString(value || "");
+const escapes = {
+  "&": "&amp;",
+  '"': "&quot;",
+  "'": "&#39;",
+  "<": "&lt;",
+  ">": "&gt;",
+  "\\": "&#92;",
+};
+function escapeOutput(value) {
+  if (value == null) return "";
+  if (value instanceof SafeString) return value.val;
+  return String(value).replace(/[&"'<>\\]/g, (char) => escapes[char]);
+}
+const templateDir = new URL("../templates/eta/", import.meta.url);
+const templateSources = readdirSync(templateDir)
+  .filter((file) => file.endsWith(".eta"))
+  .sort()
+  .map((file) => [
+    file.slice(0, -".eta".length),
+    readFileSync(new URL(file, templateDir), "utf8"),
+  ]);
+const generatedCache = new Map();
 function generated(name, fallback = "") {
-  const path = new URL(`../assets/generated/${name}`, import.meta.url);
-  return existsSync(path) ? readFileSync(path, "utf8") : fallback;
+  if (!generatedCache.has(name)) {
+    const path = new URL(`../assets/generated/${name}`, import.meta.url);
+    generatedCache.set(
+      name,
+      existsSync(path) ? readFileSync(path, "utf8") : fallback,
+    );
+  }
+  return generatedCache.get(name);
 }
 let manifest;
 export function asset(name) {
@@ -58,14 +94,19 @@ export function userData(user) {
     Administer: user.role === 1,
   };
 }
-export function roomData(room, user) {
+export function roomData(room, user, directMembers) {
   const kind = (room.type || "Rooms::Open").split("::").pop().toLowerCase();
   const members =
     kind === "direct"
-      ? all(
-          "SELECT u.* FROM users u JOIN memberships m ON m.user_id=u.id WHERE m.room_id=? ORDER BY u.name",
-          room.id,
-        ).filter((u) => u.id !== user?.id)
+      ? (
+          directMembers ??
+          all(
+            "SELECT u.* FROM users u JOIN memberships m ON m.user_id=u.id WHERE m.room_id=? ORDER BY u.name",
+            room.id,
+          )
+        )
+          .filter((u) => u.id !== user?.id)
+          .map(({ member_room_id, ...rest }) => rest)
       : [];
   return {
     ID: room.id || 0,
@@ -154,6 +195,97 @@ export function messageData(messages, origin = "") {
     };
   });
 }
+export const messageFragments = new FragmentCache(
+  Number(process.env.CAMPFIRE_FRAGMENT_CACHE_MB || 32) * 1024 * 1024,
+);
+// Changing any template must not serve HTML rendered by the previous templates.
+const templateDigest = templateSources
+  .reduce(
+    (hash, [name, source]) => hash.update(`${name}\0${source}\0`),
+    createHash("sha256"),
+  )
+  .digest("hex")
+  .slice(0, 12);
+
+// SHA-1 of message bodies by rich-text id. A hit also requires the same updated_at and an equal
+// body, so a same-millisecond edit can never reuse a stale digest.
+const bodyDigests = new Map();
+const BODY_DIGEST_BUDGET = 16 * 1024 * 1024;
+let bodyDigestBytes = 0;
+function bodyDigest(id, updatedAt, body) {
+  if (id == null) return createHash("sha1").update("").digest("base64");
+  const known = bodyDigests.get(id);
+  if (known && known.updatedAt === updatedAt && known.body === body)
+    return known.digest;
+  const digest = createHash("sha1").update(body).digest("base64");
+  if (known) bodyDigestBytes -= known.body.length * 2;
+  bodyDigests.delete(id);
+  bodyDigests.set(id, { updatedAt, body, digest });
+  bodyDigestBytes += body.length * 2;
+  for (const [oldId, old] of bodyDigests) {
+    if (bodyDigestBytes <= BODY_DIGEST_BUDGET) break;
+    bodyDigests.delete(oldId);
+    bodyDigestBytes -= old.body.length * 2;
+  }
+  return digest;
+}
+
+export function messageCacheKeys(rows, origin = "") {
+  if (!rows.length) return [];
+  const ids = JSON.stringify(rows.map((m) => m.id));
+  const contentVersions = new Map(
+    all(
+      `SELECT j.value AS id,r.id AS rich_id,r.updated_at AS rich_updated_at,r.body,a.blob_id FROM json_each(?) j LEFT JOIN action_text_rich_texts r ON r.record_type='Message' AND r.name='body' AND r.record_id=j.value LEFT JOIN active_storage_attachments a ON a.record_type='Message' AND a.name='attachment' AND a.record_id=j.value`,
+      ids,
+    ).map((r) => [
+      r.id,
+      `${bodyDigest(r.rich_id, r.rich_updated_at, r.body || "")}-${r.blob_id ?? ""}`,
+    ]),
+  );
+  const boostVersions = new Map();
+  for (const b of all(
+    `SELECT b.message_id,b.id,b.updated_at,u.name,u.updated_at AS booster_updated_at FROM boosts b JOIN users u ON u.id=b.booster_id WHERE b.message_id IN (SELECT value FROM json_each(?)) ORDER BY b.created_at`,
+    ids,
+  ))
+    boostVersions.set(
+      b.message_id,
+      (boostVersions.get(b.message_id) || "") +
+        `${b.id}-${b.updated_at}-${b.booster_updated_at}-${b.name},`,
+    );
+  // Rails keys on the message's updated_at alone. Timestamps have millisecond resolution here and
+  // replaceAttachment does not touch the message, so the key also carries the rendered inputs
+  // themselves: body digest, attachment blob, creator/booster/room names and avatar versions, and
+  // origin because Permalink embeds the request host. Names of @mentioned users are not keyed,
+  // matching Rails, whose cached fragment also keeps the old mention text until the message changes.
+  return rows.map(
+    (m) =>
+      `message/${templateDigest}/${m.id}-${m.updated_at}/${contentVersions.get(m.id)}/${m.creator_updated_at}-${m.creator_name}/${m.room_name}/${boostVersions.get(m.id) || ""}/${origin}`,
+  );
+}
+
+export function cachedMessages(
+  rows,
+  origin = "",
+  keys = messageCacheKeys(rows, origin),
+) {
+  if (!rows.length) return [];
+  const missing = rows.filter((_, i) => !messageFragments.has(keys[i]));
+  const built = new Map(
+    messageData(missing, origin).map((data) => [
+      data.ID,
+      fragment("message", data),
+    ]),
+  );
+  return rows.map((m, i) => ({
+    Fragment: safe(
+      messageFragments.fetch(
+        keys[i],
+        () =>
+          built.get(m.id) ?? fragment("message", messageData([m], origin)[0]),
+      ),
+    ),
+  }));
+}
 const translations = JSON.parse(
   readFileSync(new URL("./translations.json", import.meta.url)),
 );
@@ -167,7 +299,17 @@ const reactions = [
   ["🎉", "Party popper"],
   ["🔥", "Fire"],
 ];
-for (const [name, fn] of Object.entries({
+// Mirrors nunjucks for-loops: falsy values loop zero times, iterable objects are spread, and
+// anything else (strings included, per UTF-16 unit) is walked by index up to its length.
+function each(value) {
+  if (Array.isArray(value)) return value;
+  if (!value) return [];
+  if (typeof value === "object" && Symbol.iterator in value)
+    return Array.from(value);
+  return Array.from({ length: value.length }, (_, i) => value[i]);
+}
+const partials = Object.create(null);
+const helpers = {
   asset,
   avatar,
   epoch,
@@ -215,16 +357,27 @@ for (const [name, fn] of Object.entries({
           .join("") +
         "</dl></details>",
     ),
-}))
-  env.addGlobal(name, fn);
+  each,
+  partials,
+};
+const eta = new Eta({
+  autoTrim: false,
+  escapeFunction: escapeOutput,
+  varName: "dot",
+  functionHeader: `const { ${Object.keys(helpers).join(", ")} } = this.config.helpers;`,
+  helpers,
+});
+for (const [name, source] of templateSources) {
+  const template = eta.compile(source);
+  partials[name] = (dot) => template.call(eta, dot);
+}
 export function fragment(name, data = {}) {
-  return env.renderString(
-    `{% import "pages.html" as p %}{{ p.${name.replaceAll("-", "_")}(dot) }}`,
-    { dot: data },
-  );
+  const template = partials[name.replaceAll("-", "_")];
+  if (!template) throw new Error(`Unknown template: ${name}`);
+  return template(data);
 }
 export function render(req, screen, extra = {}) {
-  const account = get("SELECT * FROM accounts LIMIT 1");
+  const account = req.account ?? get("SELECT * FROM accounts LIMIT 1");
   let settings = {};
   try {
     settings = JSON.parse(account?.settings || "{}");
@@ -257,7 +410,6 @@ export function render(req, screen, extra = {}) {
     Title: "Campfire",
     Frame: !!req.get?.("Turbo-Frame"),
     Origin: `${req.protocol || "http"}://${req.get?.("host") || "localhost"}`,
-    CSRF: req.csrfToken || "",
     Version: "once-campfire-express",
     VAPIDPublicKey: process.env.VAPID_PUBLIC_KEY || "",
     CustomStyles: safe(
@@ -282,14 +434,5 @@ export function render(req, screen, extra = {}) {
     Query: "",
     ...extra,
   };
-  let html = fragment(screen, data);
-  const csrf = escape(req.csrfToken || "");
-  html = html.replace(
-    "</head>",
-    `<meta name="csrf-param" content="authenticity_token"><meta name="csrf-token" content="${csrf}"></head>`,
-  );
-  return html.replace(
-    /(<form\b[^>]*\bmethod="post"[^>]*>)/gi,
-    `$1<input type="hidden" name="authenticity_token" value="${csrf}">`,
-  );
+  return fragment(screen, data);
 }

@@ -155,3 +155,59 @@ test("Encrypted Rails sessions preserve custom integer values beyond JavaScript 
     r.stringify(value),
   );
 });
+
+test("cookie memo returns equal values as independent copies", () => {
+  const cookie = r.encryptCookie("_campfire_session", {
+    a: { b: [1, 2] },
+    n: 9007199254740993n,
+  });
+  const first = r.decryptCookie("_campfire_session", cookie);
+  first.a.b.push(3);
+  first.x = 1;
+  const second = r.decryptCookie("_campfire_session", cookie);
+  assert.deepEqual(second, { a: { b: [1, 2] }, n: 9007199254740993n });
+  assert.notEqual(first, second);
+  const signed = r.signCookie("session_token", "tok");
+  assert.equal(r.verifyCookie("session_token", signed), "tok");
+  assert.equal(r.verifyCookie("session_token", signed), "tok");
+});
+
+test("memoised cookies still reject tampering, wrong purpose and expiry", () => {
+  const cookie = r.encryptCookie("_campfire_session", { a: 1 });
+  r.decryptCookie("_campfire_session", cookie);
+  const tampered = cookie.replace(/^./, (c) => (c === "A" ? "B" : "A"));
+  assert.throws(() => r.decryptCookie("_campfire_session", tampered));
+  assert.throws(() => r.decryptCookie("_campfire_session", tampered));
+  assert.throws(() => r.decryptCookie("other", cookie));
+  const signed = r.signCookie("session_token", "tok");
+  assert.throws(() => r.verifyCookie("session_token", signed + "0"));
+  const expiring = r.signCookie(
+    "session_token",
+    "tok",
+    new Date(new Date(v.now).getTime() + 60000),
+  );
+  assert.equal(r.verifyCookie("session_token", expiring), "tok");
+  r.setClock(() => new Date(new Date(v.now).getTime() + 120000));
+  try {
+    assert.throws(() => r.verifyCookie("session_token", expiring));
+  } finally {
+    r.setClock(() => new Date(v.now));
+  }
+});
+
+test("signing memo is stable and follows SECRET_KEY_BASE", () => {
+  const id = r.signedId("User", 7, "avatar");
+  assert.equal(r.signedId("User", 7, "avatar"), id);
+  assert.notEqual(r.signedId("User", "7", "avatar"), id);
+  const stream = r.signStream("room:1");
+  assert.equal(r.signStream("room:1"), stream);
+  const secret = process.env.SECRET_KEY_BASE;
+  process.env.SECRET_KEY_BASE = secret + "-other";
+  try {
+    assert.notEqual(r.signedId("User", 7, "avatar"), id);
+    assert.notEqual(r.signStream("room:1"), stream);
+  } finally {
+    process.env.SECRET_KEY_BASE = secret;
+  }
+  assert.equal(r.signedId("User", 7, "avatar"), id);
+});

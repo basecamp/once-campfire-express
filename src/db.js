@@ -1,4 +1,4 @@
-import { DatabaseSync } from "node:sqlite";
+import { openDatabase } from "./sqlite.js";
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
 let connection,
@@ -18,9 +18,12 @@ export function initialize(
     ),
 ) {
   if (connection) return connection;
+  statements.clear();
+  queryCache.clear();
+  seenDataVersion = undefined;
   if (path !== ":memory:")
     mkdirSync(dirname(resolve(path)), { recursive: true });
-  connection = new DatabaseSync(path);
+  connection = openDatabase(path);
   connection.exec("PRAGMA busy_timeout=10000; PRAGMA foreign_keys=ON;");
   if (
     !connection
@@ -32,27 +35,110 @@ export function initialize(
     );
   }
   validateSchema(connection);
-  connection.exec("PRAGMA journal_mode=WAL;");
+  applyDurabilityPragmas(connection);
   return connection;
 }
+// Rails 8's SQLite adapter defaults; mmap stays off because every reader would remap after each commit.
+export function applyDurabilityPragmas(target) {
+  target.exec(
+    "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA journal_size_limit=67108864; PRAGMA cache_size=2000;",
+  );
+}
+// 16384 pages (64 MB at 4 KB pages) is a backstop so the WAL stays bounded if the background checkpointer stalls.
+export const BACKSTOP_AUTOCHECKPOINT_PAGES = 16384;
+export function deferCheckpoints(target = db()) {
+  target.exec(`PRAGMA wal_autocheckpoint=${BACKSTOP_AUTOCHECKPOINT_PAGES}`);
+}
+export const databaseFile = () => connection?.filename;
 export function db() {
   return connection || initialize();
 }
-export function all(sql, ...params) {
-  return db()
-    .prepare(sql)
-    .all(...params);
+const statements = new Map();
+const STATEMENT_LIMIT = 512;
+function statement(sql) {
+  let prepared = statements.get(sql);
+  if (!prepared) {
+    // Dynamic IN-lists create many distinct SQL strings; dropping the oldest keeps memory bounded.
+    if (statements.size >= STATEMENT_LIMIT)
+      statements.delete(statements.keys().next().value);
+    prepared = db().prepare(sql);
+    statements.set(sql, prepared);
+  }
+  return prepared;
 }
-export function get(sql, ...params) {
-  return db()
-    .prepare(sql)
-    .get(...params);
-}
+export const statementCacheSize = () => statements.size;
+// Counts statements actually executed against SQLite; query-cache hits do not count.
+let executed = 0;
+export const queryCount = () => executed;
+export const all = (sql, ...params) => {
+  executed++;
+  return statement(sql).all(...params);
+};
+// bun:sqlite returns null for no row; callers test for undefined.
+export const get = (sql, ...params) => {
+  executed++;
+  return statement(sql).get(...params) ?? undefined;
+};
+// Counts this connection's own writes: PRAGMA data_version only moves for other connections' commits.
+let writes = 0;
+export const writeEpoch = () => writes;
 export function run(sql, ...params) {
-  return db()
-    .prepare(sql)
-    .run(...params);
+  executed++;
+  writes++;
+  clearQueryCache();
+  return statement(sql).run(...params);
 }
+
+const queryCache = new Map();
+let hits = 0,
+  misses = 0,
+  seenDataVersion;
+export const clearQueryCache = () => queryCache.clear();
+export const queryCacheStats = () => ({
+  size: queryCache.size,
+  hits,
+  misses,
+});
+// data_version changes only when ANOTHER connection commits (cluster workers, other processes), so own writes clear explicitly.
+function validateQueryCache() {
+  const { data_version } = statement("PRAGMA data_version").get();
+  if (data_version !== seenDataVersion) {
+    queryCache.clear();
+    seenDataVersion = data_version;
+  }
+}
+let validatedThisTurn = false;
+// Called once per request: later cached reads in the same synchronous turn skip the PRAGMA, but any await boundary re-arms validation so a foreign commit is seen.
+export function validateQueryCacheForTurn() {
+  validateQueryCache();
+  if (validatedThisTurn) return;
+  validatedThisTurn = true;
+  queueMicrotask(() => {
+    validatedThisTurn = false;
+  });
+}
+function cached(sql, params, read, copy) {
+  if (!validatedThisTurn) validateQueryCache();
+  const key = `${sql}\u0000${JSON.stringify(params)}`;
+  if (queryCache.has(key)) {
+    const value = queryCache.get(key);
+    queryCache.delete(key);
+    queryCache.set(key, value);
+    hits++;
+    return copy(value);
+  }
+  misses++;
+  const value = read(sql, ...params);
+  const limit = Number(process.env.CAMPFIRE_QUERY_CACHE_ENTRIES) || 1000;
+  while (queryCache.size >= limit)
+    queryCache.delete(queryCache.keys().next().value);
+  queryCache.set(key, value);
+  return copy(value);
+}
+export const getCached = (sql, ...params) =>
+  cached(sql, params, get, (row) => row && { ...row });
+export const allCached = (sql, ...params) =>
+  cached(sql, params, all, (rows) => rows.map((row) => ({ ...row })));
 export function now() {
   return new Date(process.env.CAMPFIRE_FROZEN_TIME || Date.now())
     .toISOString()
@@ -63,6 +149,7 @@ export function now() {
 export function transaction(fn) {
   const name = `nested_${depth}`,
     nested = depth > 0;
+  clearQueryCache();
   db().exec(nested ? `SAVEPOINT ${name}` : "BEGIN IMMEDIATE");
   depth++;
   callbacks.push([]);
@@ -79,6 +166,8 @@ export function transaction(fn) {
     throw error;
   } finally {
     depth--;
+    writes++;
+    clearQueryCache();
   }
   if (nested) callbacks.at(-1).push(...hooks);
   else for (const callback of hooks) callback();

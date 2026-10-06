@@ -7,10 +7,10 @@ import {
   mentionIds,
   reconcileEmbeds,
 } from "./richtext.js";
-import { publish } from "./cable.js";
+import { publish, publishMany, forgetUser } from "./cable.js";
 import { stream } from "./rails.js";
-import { fragment, messageData } from "./rendering.js";
-import { enqueue } from "./jobs.js";
+import { cachedMessages } from "./rendering.js";
+import { enqueue, submitJobs } from "./jobs.js";
 export const userById = (id) =>
   get("SELECT * FROM users WHERE id=?", Number(id));
 export const roomsForUser = (id) =>
@@ -28,6 +28,26 @@ const presentation =
   "SELECT m.*,u.name AS creator_name,u.bio AS creator_bio,u.updated_at AS creator_updated_at,r.name AS room_name,r.type AS room_type FROM messages m JOIN users u ON u.id=m.creator_id JOIN rooms r ON r.id=m.room_id";
 export const messageById = (id) =>
   get(presentation + " WHERE m.id=?", Number(id));
+export function messagesByIds(ids) {
+  if (!ids.length) return [];
+  const rows = new Map(
+    all(
+      presentation + " WHERE m.id IN (SELECT value FROM json_each(?))",
+      JSON.stringify(ids),
+    ).map((row) => [row.id, row]),
+  );
+  return ids.map((id) => rows.get(id)).filter(Boolean);
+}
+export function directMembers(roomIds) {
+  const members = new Map(roomIds.map((id) => [id, []]));
+  if (roomIds.length)
+    for (const row of all(
+      "SELECT m.room_id AS member_room_id,u.* FROM users u JOIN memberships m ON m.user_id=u.id WHERE m.room_id IN (SELECT value FROM json_each(?)) ORDER BY u.name",
+      JSON.stringify(roomIds),
+    ))
+      members.get(row.member_room_id).push(row);
+  return members;
+}
 export function messagesForRoom(id, { before, after, around } = {}) {
   if (around) {
     const pivot = get(
@@ -271,17 +291,23 @@ export function publishMessage(message, action = "append") {
   const html =
     action === "remove"
       ? ""
-      : fragment("message", messageData([messageById(message.id)])[0]);
-  publish(
-    stream(room),
-    `<turbo-stream action="${action}" target="${target}" maintain_scroll="true"><template>${html}</template></turbo-stream>`,
-  );
+      : String(cachedMessages([messageById(message.id)])[0].Fragment);
+  const events = [
+    {
+      stream: stream(room),
+      message: `<turbo-stream action="${action}" target="${target}" maintain_scroll="true"><template>${html}</template></turbo-stream>`,
+    },
+  ];
   if (action === "append")
     for (const m of all(
       "SELECT user_id FROM memberships WHERE room_id=?",
       room.id,
     ))
-      publish(`user_${m.user_id}_unreads`, { roomId: room.id });
+      events.push({
+        stream: `user_${m.user_id}_unreads`,
+        message: { roomId: room.id },
+      });
+  publishMany(events);
 }
 export function notifyMessage(message, { webhooks = true } = {}) {
   const body =
@@ -290,7 +316,8 @@ export function notifyMessage(message, { webhooks = true } = {}) {
         message.id,
       )?.body || "",
     mentions = mentionIds(body),
-    room = get("SELECT * FROM rooms WHERE id=?", message.room_id);
+    room = get("SELECT * FROM rooms WHERE id=?", message.room_id),
+    jobs = [];
   for (const m of all(
     "SELECT m.*,u.role,u.status FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.room_id=? AND m.user_id<>?",
     message.room_id,
@@ -303,23 +330,35 @@ export function notifyMessage(message, { webhooks = true } = {}) {
       (room.type === "Rooms::Direct" || mentions.has(m.user_id))
     )
       for (const w of all("SELECT id FROM webhooks WHERE user_id=?", m.user_id))
-        enqueue("webhook", { webhook_id: w.id, message_id: message.id });
+        jobs.push({
+          kind: "webhook",
+          data: { webhook_id: w.id, message_id: message.id },
+        });
     if (
       (!m.connected_at ||
         Date.now() - Date.parse(m.connected_at + "Z") > 60000) &&
       (m.involvement === "everything" ||
         (m.involvement === "mentions" && mentions.has(m.user_id)))
     )
-      enqueue("push", { user_id: m.user_id, message_id: message.id });
+      jobs.push({
+        kind: "push",
+        data: { user_id: m.user_id, message_id: message.id },
+      });
   }
+  submitJobs(jobs);
 }
 export function deleteRoom(room) {
   for (const message of all("SELECT * FROM messages WHERE room_id=?", room.id))
     deleteMessage(message);
+  const memberIds = all(
+    "SELECT user_id FROM memberships WHERE room_id=?",
+    room.id,
+  ).map((m) => m.user_id);
   transaction(() => {
     run("DELETE FROM memberships WHERE room_id=?", room.id);
     run("DELETE FROM rooms WHERE id=?", room.id);
   });
+  for (const id of memberIds) forgetUser(id);
   publish(
     "rooms",
     `<turbo-stream action="remove" target="list_rooms_${room.type.split("::").pop().toLowerCase()}_${room.id}"></turbo-stream>`,

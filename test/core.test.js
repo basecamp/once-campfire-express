@@ -161,7 +161,6 @@ test("retained frontend compiles room/login/sidebar/profile/admin screens", () =
   const req = {
     user: admin,
     session: {},
-    csrfToken: "test-csrf",
     get: (name) => (name === "host" ? "example.test" : null),
     protocol: "http",
   };
@@ -187,7 +186,7 @@ test("retained frontend compiles room/login/sidebar/profile/admin screens", () =
   );
   assert.ok(fragment("messages", { Messages: [] }) === "");
 });
-test("HTTP actual cookie login, CSRF, rooms, search, posting and private denial", async () => {
+test("HTTP actual cookie login, Sec-Fetch-Site, rooms, search, posting and private denial", async () => {
   const server = createServer(createApp());
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -195,7 +194,7 @@ test("HTTP actual cookie login, CSRF, rooms, search, posting and private denial"
   try {
     let response = await fetch(base + "/session/new");
     const html = await response.text();
-    const csrf = html.match(/name="csrf-token" content="([^"]+)"/)[1];
+    assert.ok(!/csrf-token|authenticity_token/.test(html), "no CSRF tags");
     cookie = response.headers
       .getSetCookie()
       .map((c) => c.split(";")[0])
@@ -207,7 +206,6 @@ test("HTTP actual cookie login, CSRF, rooms, search, posting and private denial"
       body: new URLSearchParams({
         email_address: member.email_address,
         password: "password",
-        authenticity_token: csrf,
       }),
     });
     assert.equal(response.status, 302);
@@ -229,7 +227,6 @@ test("HTTP actual cookie login, CSRF, rooms, search, posting and private denial"
       },
       body: new URLSearchParams({
         "message[body]": "<p>Persisted HTTP marker</p>",
-        authenticity_token: csrf,
       }),
     });
     assert.equal(response.status, 201);
@@ -242,8 +239,12 @@ test("HTTP actual cookie login, CSRF, rooms, search, posting and private denial"
     );
     response = await fetch(base + "/rooms/" + open.id + "/messages", {
       method: "POST",
-      headers: { cookie, "content-type": "application/json" },
-      body: JSON.stringify({ message: { body: "without token" } }),
+      headers: {
+        cookie,
+        "content-type": "application/json",
+        "sec-fetch-site": "cross-site",
+      },
+      body: JSON.stringify({ message: { body: "cross-site" } }),
     });
     assert.equal(response.status, 422);
     response = await fetch(base + "/searches?q=Persisted", {
@@ -269,6 +270,156 @@ test("HTTP actual cookie login, CSRF, rooms, search, posting and private denial"
       },
     });
     assert.equal(response.status, 302);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+test("writes are verified by Sec-Fetch-Site and Origin instead of tokens", async () => {
+  const trusted = process.env.TRUSTED_PROXIES;
+  process.env.TRUSTED_PROXIES = "loopback";
+  const server = createServer(createApp());
+  if (trusted === undefined) delete process.env.TRUSTED_PROXIES;
+  else process.env.TRUSTED_PROXIES = trusted;
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const setCookies = (r) =>
+    r.headers.getSetCookie().map((c) => c.split(";")[0]);
+  const sessionOf = (r) =>
+    rails.decryptCookie(
+      "_campfire_session",
+      setCookies(r)
+        .find((c) => c.startsWith("_campfire_session="))
+        .slice("_campfire_session=".length),
+    );
+  try {
+    const anonymous = await fetch(base + "/session/new");
+    assert.ok(!/csrf|authenticity_token/.test(await anonymous.text()));
+    assert.equal(sessionOf(anonymous)._csrf_token, undefined);
+
+    const cookie = await signIn(base, member.email_address);
+    const post = (headers) =>
+      fetch(base + "/rooms/" + open.id + "/messages", {
+        method: "POST",
+        headers: {
+          cookie,
+          "content-type": "application/json",
+          accept: "application/json",
+          ...headers,
+        },
+        body: JSON.stringify({ message: { body: "forgery check" } }),
+      });
+    for (const [headers, status, why] of [
+      [{ "sec-fetch-site": "same-origin" }, 201, "same-origin"],
+      [{ "sec-fetch-site": "same-site" }, 201, "same-site"],
+      [{ "sec-fetch-site": "same-origin", origin: base }, 201, "own origin"],
+      [{}, 201, "missing header over plain HTTP"],
+      [{ "sec-fetch-site": "cross-site" }, 422, "cross-site"],
+      [{ "sec-fetch-site": "none" }, 422, "none"],
+      [{ "sec-fetch-site": "bogus" }, 422, "unknown value"],
+      [
+        { "sec-fetch-site": "same-origin", origin: "http://evil.test" },
+        422,
+        "foreign origin",
+      ],
+      [{ "x-forwarded-proto": "https" }, 422, "missing header over HTTPS"],
+      [
+        { "x-forwarded-proto": "https", "sec-fetch-site": "same-origin" },
+        201,
+        "same-origin over HTTPS",
+      ],
+    ])
+      assert.equal((await post(headers)).status, status, why);
+
+    // A Rails-issued session keeps its token through rewrites even though nothing reads it.
+    const railsToken = rails.b64(Buffer.alloc(32, 7));
+    const railsSession = rails.encryptCookie("_campfire_session", {
+      session_id: "f".repeat(32),
+      _csrf_token: railsToken,
+    });
+    const sessionToken = cookie
+      .split("; ")
+      .find((c) => c.startsWith("session_token="));
+    const withRails = `${sessionToken}; _campfire_session=${encodeURIComponent(railsSession)}`;
+    const visited = await fetch(base + "/rooms/" + open.id, {
+      headers: { cookie: withRails },
+    });
+    assert.equal(visited.status, 200);
+    const rewritten = sessionOf(visited);
+    assert.equal(rewritten._csrf_token, railsToken);
+    assert.equal(rewritten.last_room_id, open.id);
+
+    const settled = [sessionToken, ...setCookies(visited)].join("; ");
+    const page = async () =>
+      (
+        await fetch(base + "/rooms/" + open.id, {
+          headers: { cookie: settled },
+        })
+      ).text();
+    const first = await page();
+    assert.ok(!/csrf-token|authenticity_token/.test(first));
+    assert.equal(await page(), first, "repeat pages are byte-identical");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+async function signIn(base, email) {
+  let response = await fetch(base + "/session/new");
+  const cookies = (r) => r.headers.getSetCookie().map((c) => c.split(";")[0]);
+  const cookie = cookies(response).join("; ");
+  response = await fetch(base + "/session", {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      email_address: email,
+      password: "password",
+    }),
+  });
+  assert.equal(response.status, 302);
+  return [cookie, ...cookies(response)].join("; ");
+}
+
+test("search and sidebar issue a bounded number of queries", async () => {
+  const { queryCount } = await import("../src/db.js");
+  for (let i = 0; i < 30; i++)
+    domain.createMessage(open.id, admin.id, `needle ${i}`);
+  for (const other of [member, outsider]) {
+    const t = now();
+    const id = run(
+      "INSERT INTO rooms(name,type,creator_id,created_at,updated_at) VALUES(NULL,'Rooms::Direct',?,?,?)",
+      admin.id,
+      t,
+      t,
+    ).lastInsertRowid;
+    domain.grantMemberships(get("SELECT * FROM rooms WHERE id=?", id), [
+      admin.id,
+      other.id,
+    ]);
+  }
+  const server = createServer(createApp());
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const cookie = await signIn(base, admin.email_address);
+    let before = queryCount();
+    assert.equal(
+      (await fetch(`${base}/searches?q=needle`, { headers: { cookie } }))
+        .status,
+      200,
+    );
+    assert.ok(
+      queryCount() - before < 15,
+      `search ran ${queryCount() - before} queries`,
+    );
+    before = queryCount();
+    assert.equal(
+      (await fetch(`${base}/users/me/sidebar`, { headers: { cookie } })).status,
+      200,
+    );
+    assert.ok(
+      queryCount() - before < 12,
+      `sidebar ran ${queryCount() - before} queries`,
+    );
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
@@ -352,8 +503,6 @@ test("failed image create and edit leave existing message body, attachments and 
     const response = await fetch(base + "/rooms/" + open.id, {
         headers: { cookie: auth },
       }),
-      html = await response.text(),
-      csrf = html.match(/name="csrf-token" content="([^"]+)"/)[1],
       cookie =
         auth +
         "; " +
@@ -385,7 +534,6 @@ test("failed image create and edit leave existing message body, attachments and 
     const before = snapshot();
     const form = (method) => {
       const body = new FormData();
-      body.append("authenticity_token", csrf);
       if (method) body.append("_method", method);
       body.append("message[body]", "Must not persist");
       body.append(
@@ -467,9 +615,6 @@ test("room namespaces cannot promote direct history or bypass shared room admini
     const loginPage = await fetch(base + "/rooms/" + open.id, {
       headers: { cookie: auth },
     });
-    const csrf = (await loginPage.text()).match(
-      /name="csrf-token" content="([^"]+)"/,
-    )[1];
     const cookie =
       auth +
       "; " +
@@ -503,7 +648,7 @@ test("room namespaces cannot promote direct history or bypass shared room admini
         redirect: "manual",
         headers: {
           cookie,
-          "x-csrf-token": csrf,
+          "sec-fetch-site": "same-origin",
           "content-type": "application/x-www-form-urlencoded",
         },
         ...(method === "GET"
@@ -548,4 +693,247 @@ test("Attachment-only bot JSON and notification text use the original filename",
     serializeMessage(message, req).body.plain_text,
     "contract-file.txt",
   );
+});
+
+test("fragment renders precompiled Eta templates without recompiling", async () => {
+  const { Eta } = await import("eta");
+  const original = globalThis.Function;
+  let compiles = 0;
+  // Eta compiles each template with `new Function`, so counting constructions counts compiles.
+  globalThis.Function = new Proxy(original, {
+    construct(target, args) {
+      compiles++;
+      return Reflect.construct(target, args);
+    },
+  });
+  try {
+    new Eta().compile("probe");
+    assert.equal(compiles, 1);
+    for (let i = 0; i < 5; i++) {
+      fragment("messages", { Messages: [] });
+      fragment("prompt-item", { Mention: { Name: "x" } });
+    }
+    assert.equal(compiles, 1);
+  } finally {
+    globalThis.Function = original;
+  }
+  assert.throws(() => fragment("no-such-template"), /Unknown template/);
+});
+test("fragment output keeps nunjucks escaping and safe strings", async () => {
+  const { safe } = await import("../src/rendering.js");
+  const html = fragment("prompt-item", {
+    Mention: { Name: `a\\<b>&"'`, SGID: null },
+    HTML: safe("<i>kept</i>"),
+  });
+  assert.ok(html.includes('search="a&#92;&lt;b&gt;&amp;&quot;&#39;"'));
+  assert.ok(html.includes('sgid=""'));
+  assert.ok(html.includes("<i>kept</i>"));
+});
+const { replaceAttachment } = await import("../src/storage.js");
+async function httpSession(user, token) {
+  run(
+    "INSERT INTO sessions(user_id,token,created_at,updated_at,last_active_at) VALUES(?,?,?,?,?)",
+    user.id,
+    token,
+    now(),
+    now(),
+    now(),
+  );
+  const server = createServer(createApp());
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const host = `127.0.0.1:${server.address().port}`,
+    base = `http://${host}`,
+    auth =
+      "session_token=" +
+      encodeURIComponent(rails.signCookie("session_token", token));
+  const response = await fetch(base + "/", { headers: { cookie: auth } });
+  const cookie = [
+    auth,
+    ...response.headers.getSetCookie().map((c) => c.split(";")[0]),
+  ].join("; ");
+  const page = async (path, headers = {}) => {
+    const r = await fetch(base + path, { headers: { cookie, ...headers } });
+    assert.equal(r.status, 200, path);
+    return r.text();
+  };
+  const post = (path, fields) =>
+    fetch(base + path, {
+      method: "POST",
+      redirect: "manual",
+      headers: {
+        cookie,
+        "content-type": "application/x-www-form-urlencoded",
+        accept: "text/vnd.turbo-stream.html, text/html",
+      },
+      body: new URLSearchParams(fields),
+    });
+  return {
+    host,
+    cookie,
+    page,
+    post,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+}
+test("room HTML reflects edits, boosts, renames and attachments even when timestamps do not move, and never leaks hosts", async () => {
+  // Frozen time makes every write reuse one updated_at, so freshness cannot rely on timestamps alone.
+  const frozen = process.env.CAMPFIRE_FROZEN_TIME;
+  process.env.CAMPFIRE_FROZEN_TIME = "2026-01-02T03:04:05.678Z";
+  const http = await httpSession(admin, "fragment-cache-session");
+  try {
+    const creator = domain.createUser({
+      name: "Fragment Author",
+      email_address: "fragment-author@example.test",
+      password: "password",
+    });
+    domain.grantMemberships(open, [creator.id]);
+    const message = domain.createMessage(
+      open.id,
+      creator.id,
+      "<p>First fragment body</p>",
+      "fragment-client",
+    );
+    const path = `/rooms/${open.id}/@${message.id}`;
+    const room = () => http.page(path);
+    const cold = await room();
+    assert.ok(cold.includes("First fragment body"));
+    const { messageFragments } = await import("../src/rendering.js");
+    assert.ok(messageFragments.size > 0, "room messages are cached");
+    assert.equal(await room(), cold, "warm page equals cold page");
+
+    domain.updateMessage(message, "<p>Edited fragment body</p>");
+    let html = await room();
+    assert.ok(html.includes("Edited fragment body"), "a: edit shows");
+    assert.ok(!html.includes("First fragment body"));
+
+    let response = await http.post(`/messages/${message.id}/boosts`, {
+      "boost[content]": "Fragboost",
+    });
+    assert.ok(response.status < 400, `boost create ${response.status}`);
+    const boost = get(
+      "SELECT id FROM boosts WHERE message_id=? AND content='Fragboost'",
+      message.id,
+    );
+    assert.ok(boost);
+    assert.ok((await room()).includes("Fragboost"), "b: boost shows");
+    response = await http.post(`/messages/${message.id}/boosts/${boost.id}`, {
+      _method: "delete",
+    });
+    assert.ok(response.status < 400, `boost delete ${response.status}`);
+    assert.ok(!(await room()).includes("Fragboost"), "b: boost removed");
+    await http.post(`/messages/${message.id}/boosts`, {
+      "boost[content]": "Fragboost again",
+    });
+    assert.ok((await room()).includes("Admin boosted Fragboost again"));
+    run("UPDATE users SET name='Booster Renamed' WHERE id=?", admin.id);
+    try {
+      assert.ok(
+        (await room()).includes("Booster Renamed boosted Fragboost again"),
+        "b: booster rename shows",
+      );
+    } finally {
+      run("UPDATE users SET name='Admin' WHERE id=?", admin.id);
+    }
+
+    run(
+      "UPDATE users SET name='Renamed',updated_at=? WHERE id=?",
+      now(),
+      creator.id,
+    );
+    html = await room();
+    assert.ok(
+      html.includes('<strong data-reply-target="author">Renamed</strong>'),
+      "c: rename shows",
+    );
+    assert.ok(!html.includes("Fragment Author"));
+
+    run("UPDATE rooms SET name='Open Renamed' WHERE id=?", open.id);
+    assert.ok(
+      (await room()).includes(">Open Renamed</a>"),
+      "room rename shows",
+    );
+    run("UPDATE rooms SET name='Open' WHERE id=?", open.id);
+
+    replaceAttachment(
+      {
+        buffer: Buffer.from("first"),
+        originalname: "first-fragment.txt",
+        mimetype: "text/plain",
+      },
+      "Message",
+      message.id,
+      "attachment",
+    );
+    assert.ok((await room()).includes("first-fragment.txt"));
+    replaceAttachment(
+      {
+        buffer: Buffer.from("second"),
+        originalname: "second-fragment.txt",
+        mimetype: "text/plain",
+      },
+      "Message",
+      message.id,
+      "attachment",
+    );
+    html = await room();
+    assert.ok(html.includes("second-fragment.txt"), "d: new attachment");
+    assert.ok(!html.includes("first-fragment.txt"));
+
+    html = await http.page(path, { host: "evil.test" });
+    const permalink = (host) =>
+      `data-copy-to-clipboard-content-value="http://${host}/rooms/${open.id}/@${message.id}"`;
+    assert.ok(html.includes(permalink("evil.test")), "e: host permalink");
+    html = await room();
+    assert.ok(!html.includes("evil.test"), "e: host must not leak");
+    assert.ok(html.includes(permalink(http.host)));
+  } finally {
+    await http.close();
+    if (frozen === undefined) delete process.env.CAMPFIRE_FROZEN_TIME;
+    else process.env.CAMPFIRE_FROZEN_TIME = frozen;
+  }
+});
+
+test("messages page answers unchanged conditional requests with 304 before rendering", async () => {
+  const { messageFragments } = await import("../src/rendering.js");
+  const http = await httpSession(admin, "etag-session");
+  const url = `http://${http.host}/rooms/${open.id}/messages`;
+  const get = (headers = {}) =>
+    fetch(url, { headers: { cookie: http.cookie, ...headers } });
+  const fetchOriginal = messageFragments.fetch;
+  let renders = 0;
+  messageFragments.fetch = function (...args) {
+    renders++;
+    return fetchOriginal.apply(this, args);
+  };
+  try {
+    domain.createMessage(open.id, admin.id, "<p>etag one</p>");
+    const first = await get();
+    const etag = first.headers.get("etag");
+    assert.equal(first.status, 200);
+    assert.match(etag, /^W\/"[0-9a-f]{40}"$/);
+    await first.text();
+
+    renders = 0;
+    const second = await get({ "if-none-match": etag });
+    assert.equal(second.status, 304);
+    assert.equal(await second.text(), "");
+    assert.equal(renders, 0, "304 must not render");
+
+    const created = domain.createMessage(open.id, admin.id, "<p>etag two</p>");
+    const third = await get({ "if-none-match": etag });
+    assert.equal(third.status, 200);
+    const grown = third.headers.get("etag");
+    assert.notEqual(grown, etag);
+    await third.text();
+    assert.equal((await get({ "if-none-match": grown })).status, 304);
+
+    run("DELETE FROM messages WHERE id=?", created.id);
+    const afterDelete = await get({ "if-none-match": grown });
+    assert.equal(afterDelete.status, 200);
+    assert.notEqual(afterDelete.headers.get("etag"), grown);
+    await afterDelete.text();
+  } finally {
+    messageFragments.fetch = fetchOriginal;
+    await http.close();
+  }
 });

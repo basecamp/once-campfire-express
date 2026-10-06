@@ -43,15 +43,74 @@ export function decode64(value) {
     throw new Error("invalid base64");
   return Buffer.from(value, "base64");
 }
+const MEMO_LIMIT = 1000;
+const cookieMemo = new Map();
+const signMemo = new Map();
+let memoSecret;
+// Every memo is a pure function of its input and SECRET_KEY_BASE; drop them all when the secret changes.
+function syncSecret(secret) {
+  if (secret === memoSecret) return;
+  memoSecret = secret;
+  keys.clear();
+  cookieMemo.clear();
+  signMemo.clear();
+}
+function remember(memo, id, value) {
+  if (memo.size >= MEMO_LIMIT) memo.delete(memo.keys().next().value);
+  memo.set(id, value);
+}
+function recall(memo, id) {
+  const value = memo.get(id);
+  if (value !== undefined) {
+    memo.delete(id);
+    memo.set(id, value);
+  }
+  return value;
+}
+function cloneValue(v) {
+  if (v === null || typeof v !== "object") return v;
+  if (Array.isArray(v)) return v.map(cloneValue);
+  const copy = Object.getPrototypeOf(v) === null ? Object.create(null) : {};
+  for (const k of Object.keys(v)) copy[k] = cloneValue(v[k]);
+  return copy;
+}
+let observedExpiry = null;
+function memoizedCookie(name, raw, compute) {
+  syncSecret(process.env.SECRET_KEY_BASE);
+  const id = name + "\u0000" + raw;
+  const hit = recall(cookieMemo, id);
+  if (hit) {
+    if (hit.error) throw new Error(hit.error);
+    if (hit.exp === null || hit.exp > clock().getTime())
+      return cloneValue(hit.value);
+    cookieMemo.delete(id);
+  }
+  observedExpiry = null;
+  try {
+    const value = compute();
+    remember(cookieMemo, id, {
+      value: cloneValue(value),
+      exp: observedExpiry,
+    });
+    return value;
+  } catch (e) {
+    if (!/^expired/.test(e.message))
+      remember(cookieMemo, id, { error: e.message });
+    throw e;
+  }
+}
 export function key(salt, length = 64) {
   const secret = process.env.SECRET_KEY_BASE;
   if (!secret) throw new Error("SECRET_KEY_BASE is required");
-  const id = JSON.stringify([secret, salt, length]);
-  if (!keys.has(id)) {
+  syncSecret(secret);
+  const id = salt + "\u0000" + length;
+  let derived = keys.get(id);
+  if (!derived) {
     if (keys.size >= 64) keys.clear();
-    keys.set(id, pbkdf2Sync(secret, salt, 1000, length, "sha256"));
+    derived = pbkdf2Sync(secret, salt, 1000, length, "sha256");
+    keys.set(id, derived);
   }
-  return keys.get(id);
+  return derived;
 }
 const mac = (data, salt, algorithm = "sha1") =>
   createHmac(algorithm, key(salt)).update(data).digest("hex");
@@ -240,13 +299,20 @@ function cookieValue(raw, name) {
     const m = parseJSON(raw.toString())._rails;
     if (m.pur && m.pur !== "cookie." + name)
       throw new Error("invalid cookie purpose");
-    if (m.exp && !(new Date(m.exp).getTime() > clock().getTime()))
-      throw new Error("expired cookie");
+    if (m.exp) {
+      const exp = new Date(m.exp).getTime();
+      if (!(exp > clock().getTime())) throw new Error("expired cookie");
+      observedExpiry = exp;
+    }
     raw = decode64(m.message);
   }
   return parseJSON(raw.toString());
 }
-export function verifyCookie(name, raw) {
+export const verifyCookie = (name, raw) =>
+  typeof raw === "string"
+    ? memoizedCookie(name, "v" + raw, () => verifyCookieUncached(name, raw))
+    : verifyCookieUncached(name, raw);
+function verifyCookieUncached(name, raw) {
   raw = decodeURIComponent(raw);
   const i = raw.lastIndexOf("--");
   if (i < 0) throw new Error("invalid cookie");
@@ -268,7 +334,11 @@ export function encryptCookie(name, value, expiry = null, options = {}) {
   ]);
   return [data, nonce, cipher.getAuthTag()].map(b64).join("--");
 }
-export function decryptCookie(name, raw) {
+export const decryptCookie = (name, raw) =>
+  typeof raw === "string"
+    ? memoizedCookie(name, "d" + raw, () => decryptCookieUncached(name, raw))
+    : decryptCookieUncached(name, raw);
+function decryptCookieUncached(name, raw) {
   const parts = decodeURIComponent(raw).split("--");
   if (parts.length !== 3) throw new Error("invalid cookie");
   const [data, nonce, tag] = parts.map(decode64);
@@ -295,6 +365,17 @@ function modelPurpose(model, purpose) {
   return underscored + (purpose ? "/" + purpose : "");
 }
 export function signedId(model, id, purpose = "", expiry = null) {
+  if (expiry) return signedIdUncached(model, id, purpose, expiry);
+  syncSecret(process.env.SECRET_KEY_BASE);
+  const memoKey = `${model}\u0000${typeof id}\u0000${id}\u0000${purpose}`;
+  let value = recall(signMemo, memoKey);
+  if (value === undefined) {
+    value = signedIdUncached(model, id, purpose, expiry);
+    remember(signMemo, memoKey, value);
+  }
+  return value;
+}
+function signedIdUncached(model, id, purpose, expiry) {
   return model === "ActiveStorage::Blob"
     ? sign(id, "ActiveStorage", purpose || "blob_id", expiry)
     : sign(
@@ -334,7 +415,17 @@ export function verifyId(model, raw, purpose = "") {
 export const stream = (room) =>
   Buffer.from(`gid://campfire/${room.type}/${room.id}`).toString("base64url") +
   ":messages";
-export const signStream = (name) =>
+export function signStream(name) {
+  syncSecret(process.env.SECRET_KEY_BASE);
+  const memoKey = "stream\u0000" + name;
+  let value = recall(signMemo, memoKey);
+  if (value === undefined) {
+    value = signStreamUncached(name);
+    remember(signMemo, memoKey, value);
+  }
+  return value;
+}
+const signStreamUncached = (name) =>
   sign(
     name,
     "turbo/signed_stream_verifier_key",
