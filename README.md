@@ -47,15 +47,15 @@ connection was 24 ms for Rails and 14 ms for Express. Every message reached ever
 connection in both runs.
 
 The table above predates the caching work below. A later matched run on a 16-thread x86-64
-host (same harness, 16 clients, servers on 4 hardware threads) measured this branch:
+host (same harness, 16 clients, servers on 4 hardware threads) measured this branch (the first column is `main` before these changes, same host):
 
-| HTTP workload (requests/sec) | Express on Node 24 | Express on Bun 1.4.2 | Rust |
-|---|---:|---:|---:|
-| Room page | 20,509 | 23,881 | 18,419 |
-| Messages page | 31,991 | 35,493 | 20,449 |
-| Sidebar | 35,548 | 41,802 | 17,923 |
-| Search | 35,233 | 41,134 | 17,960 |
-| Post a message | 1,386 | 1,501 | 4,097 |
+| HTTP workload (requests/sec) | Node 24 before caching | Express on Node 24 | Express on Bun 1.4.2 | Rust |
+|---|---:|---:|---:|---:|
+| Room page | 395 | 20,509 | 23,881 | 18,419 |
+| Messages page | 546 | 31,991 | 35,493 | 20,449 |
+| Sidebar | 3,059 | 35,548 | 41,802 | 17,923 |
+| Search | 935 | 35,233 | 41,134 | 17,960 |
+| Post a message | 124 | 1,386 | 1,501 | 4,097 |
 
 Reads hit the whole-page response cache because the read benchmark performs no concurrent
 writes; any committed write clears it, so mixed workloads read closer to uncached rendering.
