@@ -20,7 +20,8 @@ class Page {
   }
 }
 
-// Byte-bounded LRU of whole rendered HTML pages. Entries are valid for one database epoch only:
+// Byte-bounded LRU of whole rendered HTML pages, off unless CAMPFIRE_RESPONSE_CACHE_MB is set
+// (neither Rails nor the Rust port caches whole pages). Entries are valid for one database epoch only:
 // the first lookup under a new epoch drops them all, since none can be served again.
 export class ResponseCache {
   #entries = new Map();
@@ -105,7 +106,7 @@ export class ResponseCache {
 
 export function budgetFromEnv(value) {
   const mb = value === undefined || value === "" ? NaN : Number(value);
-  return Math.floor((Number.isFinite(mb) && mb >= 0 ? mb : 32) * 1024 * 1024);
+  return Math.floor((Number.isFinite(mb) && mb > 0 ? mb : 0) * 1024 * 1024);
 }
 
 export const responseCache = new ResponseCache(

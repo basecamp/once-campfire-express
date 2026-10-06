@@ -6,7 +6,7 @@ import { execFile } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import express from "express";
 import sharp from "sharp";
-import { all, get, run, transaction, now } from "./db.js";
+import { all, get, run, transaction, now, touch } from "./db.js";
 import * as rails from "./rails.js";
 
 const execute = promisify(execFile);
@@ -85,6 +85,7 @@ export function storeUpload(upload, recordType, recordId, name) {
         id,
         now(),
       );
+      touchRecord(recordType, recordId);
       return get("SELECT * FROM active_storage_blobs WHERE id=?", id);
     }),
   );
@@ -107,7 +108,12 @@ export function attachSigned(token, recordType, recordId, name, userId = null) {
     id,
     now(),
   );
+  touchRecord(recordType, recordId);
   return blob;
+}
+// Like Rails' `belongs_to :record, touch: true`: rendered messages are cached by updated_at.
+function touchRecord(recordType, recordId) {
+  if (recordType === "Message") touch("messages", recordId);
 }
 export function removeAttachment(recordType, recordId, name) {
   const ids = all(
@@ -122,6 +128,7 @@ export function removeAttachment(recordType, recordId, name) {
     recordId,
     name,
   );
+  if (ids.length) touchRecord(recordType, recordId);
   return ids;
 }
 export function replaceAttachment(upload, recordType, recordId, name) {

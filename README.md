@@ -47,18 +47,20 @@ connection was 24 ms for Rails and 14 ms for Express. Every message reached ever
 connection in both runs.
 
 The table above predates the caching work below. A later matched run on a 16-thread x86-64
-host (same harness, 16 clients, servers on 4 hardware threads) measured this branch (the first column is `main` before these changes, same host):
+host (same harness, 16 clients, servers on 4 hardware threads, Rust-style caching; the first
+column is `main` before these changes on the same host):
 
 | HTTP workload (requests/sec) | Node 24 before caching | Express on Node 24 | Express on Bun 1.4.2 | Rust |
 |---|---:|---:|---:|---:|
-| Room page | 395 | 20,509 | 23,881 | 18,419 |
-| Messages page | 546 | 31,991 | 35,493 | 20,449 |
-| Sidebar | 3,059 | 35,548 | 41,802 | 17,923 |
-| Search | 935 | 35,233 | 41,134 | 17,960 |
-| Post a message | 124 | 1,386 | 1,501 | 4,097 |
+| Room page | 395 | 2,012 | 4,759 | 19,493 |
+| Messages page | 546 | 2,556 | 5,992 | 21,698 |
+| Sidebar | 3,059 | 20,358 | 23,022 | 18,623 |
+| Search | 935 | 4,526 | 11,014 | 18,933 |
+| Post a message | 124 | 1,374 | 1,668 | 4,276 |
 
-Reads hit the whole-page response cache because the read benchmark performs no concurrent
-writes; any committed write clears it, so mixed workloads read closer to uncached rendering.
+Median Cable delivery to 100 sockets: 5–7 ms on Node and Bun, 1.5 ms on Rust. With the opt-in
+whole-page cache (`CAMPFIRE_RESPONSE_CACHE_MB=32`) and no concurrent writes, reads reached
+20–36k req/s on Node and 24–42k on Bun; any committed write clears that cache.
 
 Optimizations compared with the Rust port (🟡 = partial; the extra index is omitted to keep
 the original schema):
@@ -66,7 +68,7 @@ the original schema):
 | Optimization | Rust | Express (Node/Bun) |
 |---|:---:|:---:|
 | Message fragment cache (Rails `cache message`) | ✅ | ✅ |
-| Whole-page response cache | ❌ | ✅ |
+| Whole-page response cache | ❌ | opt-in |
 | Query-result cache for per-request auth reads | ❌ | ✅ |
 | Prepared-statement cache + Rails 8 SQLite pragmas | ✅ | ✅ |
 | 304 for the messages page (`fresh_when`) | ✅ | ✅ |
@@ -75,7 +77,8 @@ the original schema):
 | Whole-body gzip cache | ✅ | ✅ |
 | Precompressed `.br`/`.gz` assets | 🟡 | ✅ |
 | Zero-copy assets embedded in the binary | ✅ | ❌ |
-| In-memory cache for public responses (Thruster-style) | ✅ | ❌ |
+| In-memory cache for public responses (Thruster-style) | ✅ | ✅ |
+| Sidebar direct-row fragment cache | ✅ | ✅ |
 | WAL checkpoints off the request path | ✅ | ✅ |
 | Jobs off the request path | ✅ | ✅ |
 | Single writer + reader pool | ✅ | ❌ |
@@ -112,16 +115,24 @@ the original schema):
   (`CAMPFIRE_QUERY_CACHE_ENTRIES`, default 1000), cleared on own writes and when
   `PRAGMA data_version` shows another worker or job committed.
 - Rendered messages use a per-worker fragment cache (`CAMPFIRE_FRAGMENT_CACHE_MB`,
-  default 32). The key covers id/`updated_at`, a content hash, creator/booster/room names,
-  avatar versions, origin and template digest, so creator and booster renames show
-  immediately (Rails keeps them stale). @mention names stay stale until the message
-  changes, as in Rails.
+  default 32) keyed like Rails/Rust: template digest, id, `updated_at`, `presentation-v3`,
+  plus origin (permalinks embed the host). Body edits, attachment changes and boosts touch
+  `messages.updated_at` with strictly increasing microsecond values (also under
+  `CAMPFIRE_FROZEN_TIME`). Creator/booster/room renames and @mention names stay stale until
+  the message changes, as in Rails/Rust.
+- Sidebar direct-room rows share that cache, keyed by membership id/`updated_at` plus the
+  room's `updated_at` and unread flag; member renames/avatars stay stale until the
+  membership changes, as in Rails/Rust.
+- Thruster-style in-memory cache (`CAMPFIRE_FRONT_CACHE_MB`, default 64, items ≤ 1 MB) for
+  GET/HEAD responses with `public` and a positive max-age (avatars, assets): keyed by
+  method, URL, host and `Vary` headers, Set-Cookie stripped, `X-Cache: hit|miss|bypass`,
+  304 from the stored ETag.
 - The messages page answers 304 from an ETag built from the fragment keys (Rails
   `fresh_when @messages`).
 - Action Cable authorization is memoized for `CABLE_AUTH_TTL_MS` (default 1000).
   Revocation is immediate in the worker performing it, within the TTL in other workers.
-- Whole-page response cache per worker (`CAMPFIRE_RESPONSE_CACHE_MB`, default 32, 0
-  disables) for GET HTML: room, permalink, messages page, sidebar, search, show-message.
+- Opt-in whole-page response cache per worker (`CAMPFIRE_RESPONSE_CACHE_MB`, default 0 =
+  off) for GET HTML: room, permalink, messages page, sidebar, search, show-message.
   Any committed write to the main DB, from any process, invalidates all entries. Rails has
   no equivalent; output is unchanged.
 - Large HTML is gzip, not brotli: spliced from cached deflate pieces (`CAMPFIRE_GZIP_CACHE_MB`,

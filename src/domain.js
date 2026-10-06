@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import bcrypt from "bcryptjs";
-import { all, get, run, transaction, now, onCommit } from "./db.js";
+import { all, get, run, transaction, now, onCommit, touch } from "./db.js";
 import {
   sanitize,
   plainText,
@@ -15,7 +15,7 @@ export const userById = (id) =>
   get("SELECT * FROM users WHERE id=?", Number(id));
 export const roomsForUser = (id) =>
   all(
-    "SELECT r.*,m.involvement,m.unread_at FROM rooms r JOIN memberships m ON m.room_id=r.id WHERE m.user_id=? ORDER BY lower(r.name)",
+    "SELECT r.*,m.involvement,m.unread_at,m.id AS membership_id,m.updated_at AS membership_updated_at FROM rooms r JOIN memberships m ON m.room_id=r.id WHERE m.user_id=? ORDER BY lower(r.name)",
     Number(id),
   );
 export const roomForUser = (user, id) =>
@@ -237,7 +237,7 @@ export function updateMessage(
       );
       indexMessage(message.id, content, attachment?.filename || "");
     }
-    run("UPDATE messages SET updated_at=? WHERE id=?", time, message.id);
+    touch("messages", message.id);
     run("UPDATE rooms SET updated_at=? WHERE id=?", time, message.room_id);
   });
   return messageById(message.id);

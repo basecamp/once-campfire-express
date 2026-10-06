@@ -1,6 +1,7 @@
 import express from "express";
 import compression from "compression";
 import { splicedGzip } from "./gzip.js";
+import { frontCacheMiddleware } from "./front_cache.js";
 import multer from "multer";
 import path from "node:path";
 import fs from "node:fs";
@@ -185,6 +186,7 @@ export function createApp() {
   app.set("query parser", "extended");
   if (process.env.TRUSTED_PROXIES)
     app.set("trust proxy", process.env.TRUSTED_PROXIES.split(","));
+  app.use(frontCacheMiddleware());
   app.use((req, res, next) => {
     res.set({
       "X-Content-Type-Options": "nosniff",

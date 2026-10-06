@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import bcrypt from "bcryptjs";
-import { all, get, run, transaction, now } from "./db.js";
+import { all, get, run, transaction, now, touch } from "./db.js";
 import {
   roomForUser,
   roomsForUser,
@@ -24,6 +24,7 @@ import {
   fragment,
   messageData,
   cachedMessages,
+  cachedSidebarDirects,
   messageCacheKeys,
   roomData,
   userData,
@@ -396,14 +397,19 @@ export function registerRoutes(app) {
             ? 1
             : (a.name || "").localeCompare(b.name || ""),
     );
-    const members = directMembers(
-      rooms.filter((r) => r.type === "Rooms::Direct").map((r) => r.id),
+    const directs = rooms.filter((r) => r.type === "Rooms::Direct");
+    const directRows = new Map(
+      cachedSidebarDirects(directs, req.user, directMembers).map((html, i) => [
+        directs[i].id,
+        html,
+      ]),
     );
     return render(req, "sidebar", {
-      SidebarRooms: rooms.map((r) => ({
-        ...roomData(r, req.user, members.get(r.id)),
-        Unread: !!r.unread_at,
-      })),
+      SidebarRooms: rooms.map((r) =>
+        r.type === "Rooms::Direct"
+          ? { Type: r.type, Fragment: directRows.get(r.id) }
+          : { ...roomData(r, req.user), Unread: !!r.unread_at },
+      ),
       Placeholders: [],
     });
   }
@@ -834,7 +840,7 @@ function registerBoosts(app) {
             time,
           ),
           id = Number(result.lastInsertRowid);
-        run("UPDATE messages SET updated_at=? WHERE id=?", time, message.id);
+        touch("messages", message.id);
         const dto = messageData([message])[0],
           boost = dto.Boosts.find((b) => b.ID === id);
         publish(
@@ -869,7 +875,7 @@ function registerBoosts(app) {
           ),
         );
         run("DELETE FROM boosts WHERE id=?", Number(req.params.id));
-        run("UPDATE messages SET updated_at=? WHERE id=?", now(), message.id);
+        touch("messages", message.id);
         publish(
           rails.stream(room),
           `<turbo-stream action="remove" target="boost_${req.params.id}"></turbo-stream>`,

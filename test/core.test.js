@@ -786,8 +786,8 @@ async function httpSession(user, token) {
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }
-test("room HTML reflects edits, boosts, renames and attachments even when timestamps do not move, and never leaks hosts", async () => {
-  // Frozen time makes every write reuse one updated_at, so freshness cannot rely on timestamps alone.
+test("room HTML reflects edits, boosts and attachments within one frozen millisecond, keeps renames until the message changes, and never leaks hosts", async () => {
+  // Frozen time puts every write in one millisecond; touches must still move updated_at.
   const frozen = process.env.CAMPFIRE_FROZEN_TIME;
   process.env.CAMPFIRE_FROZEN_TIME = "2026-01-02T03:04:05.678Z";
   const http = await httpSession(admin, "fragment-cache-session");
@@ -837,33 +837,38 @@ test("room HTML reflects edits, boosts, renames and attachments even when timest
     });
     assert.ok((await room()).includes("Admin boosted Fragboost again"));
     run("UPDATE users SET name='Booster Renamed' WHERE id=?", admin.id);
-    try {
-      assert.ok(
-        (await room()).includes("Booster Renamed boosted Fragboost again"),
-        "b: booster rename shows",
-      );
-    } finally {
-      run("UPDATE users SET name='Admin' WHERE id=?", admin.id);
-    }
-
     run(
       "UPDATE users SET name='Renamed',updated_at=? WHERE id=?",
       now(),
       creator.id,
     );
-    html = await room();
-    assert.ok(
-      html.includes('<strong data-reply-target="author">Renamed</strong>'),
-      "c: rename shows",
-    );
-    assert.ok(!html.includes("Fragment Author"));
-
     run("UPDATE rooms SET name='Open Renamed' WHERE id=?", open.id);
-    assert.ok(
-      (await room()).includes(">Open Renamed</a>"),
-      "room rename shows",
-    );
-    run("UPDATE rooms SET name='Open' WHERE id=?", open.id);
+    try {
+      html = await room();
+      assert.ok(
+        html.includes("Admin boosted Fragboost again"),
+        "c: renames alone keep the cached message, as in Rails",
+      );
+      assert.ok(html.includes("Fragment Author"));
+      domain.updateMessage(
+        domain.messageById(message.id),
+        "<p>Edited fragment body</p>",
+      );
+      html = await room();
+      assert.ok(
+        html.includes("Booster Renamed boosted Fragboost again"),
+        "c: booster rename shows once the message changes",
+      );
+      assert.ok(
+        html.includes('<strong data-reply-target="author">Renamed</strong>'),
+        "c: creator rename shows once the message changes",
+      );
+      assert.ok(!html.includes("Fragment Author"));
+      assert.ok(html.includes(">Open Renamed</a>"), "c: room rename shows");
+    } finally {
+      run("UPDATE users SET name='Admin' WHERE id=?", admin.id);
+      run("UPDATE rooms SET name='Open' WHERE id=?", open.id);
+    }
 
     replaceAttachment(
       {
@@ -1000,4 +1005,47 @@ test("fastEtag is stable per body, weak, and differs between bodies", async () =
   assert.match(fastEtag(a), /^W\/"[0-9a-f]+-[0-9a-f]+"$/);
   assert.equal(fastEtag(a), fastEtag(Buffer.from(a)));
   assert.notEqual(fastEtag(a), fastEtag(b));
+});
+
+test("sidebar direct rows are cached per membership version, as in Rails", async () => {
+  const http = await httpSession(member, "sidebar-direct-session");
+  try {
+    const t = now();
+    const direct = get(
+      "SELECT * FROM rooms WHERE id=?",
+      run(
+        "INSERT INTO rooms(name,type,creator_id,created_at,updated_at) VALUES(NULL,'Rooms::Direct',?,?,?)",
+        member.id,
+        t,
+        t,
+      ).lastInsertRowid,
+    );
+    const peer = domain.createUser({
+      name: "Zed Peer",
+      email_address: "zed-peer@example.test",
+      password: "password",
+    });
+    domain.grantMemberships(direct, [member.id, peer.id]);
+    const sidebar = () => http.page("/users/me/sidebar");
+    assert.ok((await sidebar()).includes("Ping with</span>Zed</span>"));
+    run(
+      "UPDATE users SET name='Yann Peer',updated_at=? WHERE id=?",
+      now(),
+      peer.id,
+    );
+    assert.ok(
+      (await sidebar()).includes("Ping with</span>Zed</span>"),
+      "a rename alone keeps the cached row",
+    );
+    domain.createMessage(direct.id, peer.id, "<p>hello</p>");
+    const html = await sidebar();
+    assert.ok(html.includes("Ping with</span>Yann</span>"));
+    assert.ok(
+      html.includes(
+        `class="direct unread" id="list_rooms_direct_${direct.id}"`,
+      ),
+    );
+  } finally {
+    await http.close();
+  }
 });

@@ -151,6 +151,46 @@ export function now() {
     .replace("Z", "")
     .replace(/(\.\d{3})$/, "$1000");
 }
+function microseconds(value) {
+  const match = /^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(?:\.(\d{1,6}))?/.exec(
+    value || "",
+  );
+  if (!match) return 0;
+  return (
+    Date.parse(match[1].replace(" ", "T") + "Z") * 1000 +
+    Number((match[2] || "").padEnd(6, "0"))
+  );
+}
+function formatMicroseconds(us) {
+  return (
+    new Date(Math.floor(us / 1000))
+      .toISOString()
+      .slice(0, 19)
+      .replace("T", " ") +
+    "." +
+    String(us % 1_000_000).padStart(6, "0")
+  );
+}
+let lastTouch = 0;
+// Fragment keys carry updated_at, so a touch must move it even within one millisecond, under
+// CAMPFIRE_FROZEN_TIME, or when another worker wrote a later value: one microsecond past both
+// this process's last touch and the row's current value.
+export function touchTime(previous) {
+  const base = process.env.CAMPFIRE_FROZEN_TIME
+    ? new Date(process.env.CAMPFIRE_FROZEN_TIME).getTime()
+    : Date.now();
+  lastTouch = Math.max(base * 1000, lastTouch + 1, microseconds(previous) + 1);
+  return formatMicroseconds(lastTouch);
+}
+const touchable = new Set(["messages"]);
+export function touch(table, id) {
+  if (!touchable.has(table)) throw new Error(`Cannot touch ${table}`);
+  const time = touchTime(
+    get(`SELECT updated_at FROM ${table} WHERE id=?`, Number(id))?.updated_at,
+  );
+  run(`UPDATE ${table} SET updated_at=? WHERE id=?`, time, Number(id));
+  return time;
+}
 export function transaction(fn) {
   const name = `nested_${depth}`,
     nested = depth > 0;

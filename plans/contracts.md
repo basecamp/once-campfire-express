@@ -54,11 +54,19 @@ branch needs fresh production Docker checks and re-measured benchmarks.
   session/user/account/ban reads. Invalidated on own writes and on `PRAGMA data_version`
   change (other workers, jobs). Contract: every main-DB write goes through db.js
   `run()`/`transaction()`.
-- Message fragment cache (`CAMPFIRE_FRAGMENT_CACHE_MB`, default 32, per worker). Key:
-  id/`updated_at`, content hash, creator/booster/room names, avatar versions, origin,
-  template digest. Differs from Rails: creator/booster renames show immediately (Rails'
-  `cache [message, ...]` keeps them stale); @mention names stay stale until the message
-  changes, as in Rails.
+- Message fragment cache, per worker (`CAMPFIRE_FRAGMENT_CACHE_MB`,
+  default 32) keyed like Rails/Rust: template digest, id, `updated_at`, `presentation-v3`,
+  plus origin (permalinks embed the host). Body edits, attachment changes and boosts touch
+  `messages.updated_at` with strictly increasing microsecond values (also under
+  `CAMPFIRE_FROZEN_TIME`). Creator/booster/room renames and @mention names stay stale until
+  the message changes, as in Rails/Rust.
+- Sidebar direct-room rows share that cache, keyed by membership id/`updated_at` plus the
+  room's `updated_at` and unread flag; member renames/avatars stay stale until the
+  membership changes, as in Rails/Rust.
+- Thruster-style in-memory cache (`CAMPFIRE_FRONT_CACHE_MB`, default 64, items ≤ 1 MB) for
+  GET/HEAD responses with `public` and a positive max-age (avatars, assets): keyed by
+  method, URL, host and `Vary` headers, Set-Cookie stripped, `X-Cache: hit|miss|bypass`,
+  304 from the stored ETag.
 - Messages page answers 304 via ETag from the fragment keys (Rails `fresh_when @messages`).
 - Action Cable authorization memo `CABLE_AUTH_TTL_MS` (default 1000): revocation is
   immediate in the worker that performs it (`forgetUser`), within the TTL elsewhere.
@@ -81,8 +89,8 @@ branch needs fresh production Docker checks and re-measured benchmarks.
   Express has no `force_ssl` setting, so the Rust port's extra "app forces SSL" condition
   has no counterpart. The 189 Rails CSRF vectors still test `validCsrf`/`maskCsrf`, which
   requests no longer call.
-- Whole-page response cache per worker (`CAMPFIRE_RESPONSE_CACHE_MB`, default 32, 0
-  disables) for GET HTML: room, permalink, messages page, sidebar, search, show-message.
+- Opt-in whole-page response cache per worker (`CAMPFIRE_RESPONSE_CACHE_MB`, default 0 =
+  off) for GET HTML: room, permalink, messages page, sidebar, search, show-message.
   Any committed write to the main DB, from any process, invalidates all entries. Rails has
   no equivalent; output is unchanged.
 - Large HTML is gzip, not brotli: spliced from cached deflate pieces (`CAMPFIRE_GZIP_CACHE_MB`,

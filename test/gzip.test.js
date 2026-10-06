@@ -4,6 +4,7 @@ import zlib from "node:zlib";
 import http from "node:http";
 process.env.DATABASE_PATH = ":memory:";
 process.env.SECRET_KEY_BASE = "spliced-gzip-tests-".repeat(8);
+process.env.CAMPFIRE_RESPONSE_CACHE_MB = "32";
 const { SplicedGzip, gzipSpliced, splicedGzipCache, fastEtag } =
   await import("../src/gzip.js");
 const { run, get, now, initialize } = await import("../src/db.js");
