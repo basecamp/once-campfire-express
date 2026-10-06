@@ -1,9 +1,10 @@
 # once-campfire-express
 
-ONCE Campfire implemented natively with Node.js 24 and Express 5. The existing SQLite
+ONCE Campfire implemented natively with Bun 1.4.2 (`bun:sqlite`) and Express 5. The existing SQLite
 schema, uploaded files, bcrypt passwords and Rails login cookies remain compatible.
-Nunjucks renders the retained Turbo/Stimulus/Lexxy frontend; native WebSockets speak
-Action Cable. No other Campfire implementation runs in the application process.
+Eta templates (`templates/eta/`, converted byte for byte from the former nunjucks macros by
+`bin/nunjucks-to-eta.js`) render the retained Turbo/Stimulus/Lexxy frontend; native WebSockets
+speak Action Cable. No other Campfire implementation runs in the application process.
 
 ```sh
 git submodule update --init
@@ -18,9 +19,10 @@ sets the HTTP process count; publications pass through the primary process to ev
 worker. A separate leased SQLite queue handles jobs. TLS terminates at a proxy;
 configure `TRUSTED_PROXIES` with its addresses.
 
-For local development, use the pinned Node version, run `npm ci`,
-`npm run build:assets`, set `SECRET_KEY_BASE`, then `npm start`. Run `npm test` for
-native integration and independent Rails golden-vector tests. The public Rails
+For local development, install the pinned Bun (`.bun-version`), run `bun install`,
+`bun run build:assets`, set `SECRET_KEY_BASE`, then `bun run start`. Run `bun run test`
+(each test file in its own `bun test` process) for native integration and independent
+Rails golden-vector tests. The public Rails
 reference is immutable and pinned at `659f957`.
 
 See [verification](plans/contracts.md) for tested workflows and remaining limits,
@@ -43,15 +45,62 @@ At 100 WebSocket connections and five messages/second, median delivery to every
 connection was 24 ms for Rails and 14 ms for Express. Every message reached every
 connection in both runs.
 
+The table predates the Bun runtime and the caching work below; it will be re-measured.
+
 ## Known differences
 
 - TLS terminates at a configured proxy.
+- CSRF: `Sec-Fetch-Site` replaces tokens. Writes accept `same-origin` and `same-site`,
+  reject `cross-site`, `none` and missing headers over HTTPS with 422, and retain the
+  `Origin` check. Plain HTTP accepts missing headers with `SameSite=Lax` cookies. Pages omit
+  CSRF tags and fields; old tabs still work, but HTTPS forms require a browser that sends
+  the header (Safari 16.4 or newer). Rails-issued sessions keep their `_csrf_token`; new
+  sessions get none. Bot-key message routes stay exempt. `assets/overrides/models/file_uploader.js`
+  drops the upload's `X-CSRF-Token` header, which read the removed meta tag.
 - Attached downloads and inline attachments recheck room membership; new draft uploads
   belong to their uploader. Legacy unattached signed drafts remain usable after sign-in.
 - Native media variants use a separate digest namespace, preserving original files and
   rebuilding previews as needed. Native-library media bytes can differ.
 - HTML whitespace and malformed-fragment repair can differ. Full byte parity is not claimed.
 - Direct-room autocomplete explicitly requests JSON, repairing the original fetch-header bug.
+- Runtime is Bun only. Integers above 2^53 read from SQLite are rounded by `bun:sqlite`
+  (safeIntegers off); the Campfire schema stores none.
+- Eta templates replace nunjucks with byte-identical output (fuzz and snapshot checked,
+  escaping identical including backslash). `push_subscriptions` with two or more
+  subscriptions threw under nunjucks and now renders.
+- SQLite uses Rails 8 pragmas (WAL, `synchronous=NORMAL`, `journal_size_limit` 64 MB,
+  `cache_size` 2000, mmap off) and a bounded (512) prepared-statement cache.
+- Per-request session/user/account/ban reads use a query-result LRU
+  (`CAMPFIRE_QUERY_CACHE_ENTRIES`, default 1000), cleared on own writes and when
+  `PRAGMA data_version` shows another worker or job committed.
+- Rendered messages use a per-worker fragment cache (`CAMPFIRE_FRAGMENT_CACHE_MB`,
+  default 32). The key covers id/`updated_at`, a content hash, creator/booster/room names,
+  avatar versions, origin and template digest, so creator and booster renames show
+  immediately (Rails keeps them stale). @mention names stay stale until the message
+  changes, as in Rails.
+- The messages page answers 304 from an ETag built from the fragment keys (Rails
+  `fresh_when @messages`).
+- Action Cable authorization is memoized for `CABLE_AUTH_TTL_MS` (default 1000).
+  Revocation is immediate in the worker performing it, within the TTL in other workers.
+- Whole-page response cache per worker (`CAMPFIRE_RESPONSE_CACHE_MB`, default 32, 0
+  disables) for GET HTML: room, permalink, messages page, sidebar, search, show-message.
+  Any committed write to the main DB, from any process, invalidates all entries. Rails has
+  no equivalent; output is unchanged.
+- Large HTML is gzip, not brotli: spliced from cached deflate pieces (`CAMPFIRE_GZIP_CACHE_MB`,
+  default 32) or built once per cached page. Digested assets are served from precompressed
+  `.br`/`.gz` files built by `bin/build-assets.js`; the file set is read at startup.
+- Rails cookie decryption and signature checks are memoized in bounded LRUs; cookies with an
+  expiry are re-checked on every hit.
+- Message notification, push and webhook jobs are enqueued in one batch after the response,
+  through the primary (single writer). A hard crash between response and enqueue loses
+  them; clean shutdown flushes. Jobs run in parallel up to `JOB_CONCURRENCY` (default 3),
+  so completion order is not queue order. The jobs DB uses `synchronous=NORMAL`.
+- WAL checkpoints run on a background thread (`src/checkpoint.js`) in the primary every
+  second, truncating above 64 MB; every process keeps a 64 MB autocheckpoint backstop.
+- Action Cable keeps a per-stream subscriber index. A revoked or dead socket is cut off on
+  the next publish to one of its own streams, by `forgetUser` in the revoking worker, or by
+  the 3 s ping.
+- Backups use `VACUUM INTO` (consistent snapshot) instead of the online backup API.
 - Backups require a maintenance window for consistent database and file snapshots. App and
   queue snapshots are separate; external job effects have at-least-once delivery.
 
