@@ -60,6 +60,30 @@ host (same harness, 16 clients, servers on 4 hardware threads) measured this bra
 Reads hit the whole-page response cache because the read benchmark performs no concurrent
 writes; any committed write clears it, so mixed workloads read closer to uncached rendering.
 
+Optimizations compared with the Rust port (🟡 = partial; the extra index is omitted to keep
+the original schema):
+
+| Optimization | Rust | Express (Node/Bun) |
+|---|:---:|:---:|
+| Message fragment cache (Rails `cache message`) | ✅ | ✅ |
+| Whole-page response cache | ❌ | ✅ |
+| Query-result cache for per-request auth reads | ❌ | ✅ |
+| Prepared-statement cache + Rails 8 SQLite pragmas | ✅ | ✅ |
+| 304 for the messages page (`fresh_when`) | ✅ | ✅ |
+| CSRF via `Sec-Fetch-Site` (byte-stable pages) | ✅ | ✅ |
+| Spliced gzip from cached deflate pieces | ✅ | ✅ |
+| Whole-body gzip cache | ✅ | ✅ |
+| Precompressed `.br`/`.gz` assets | 🟡 | ✅ |
+| Zero-copy assets embedded in the binary | ✅ | ❌ |
+| In-memory cache for public responses (Thruster-style) | ✅ | ❌ |
+| WAL checkpoints off the request path | ✅ | ✅ |
+| Jobs off the request path | ✅ | ✅ |
+| Single writer + reader pool | ✅ | ❌ |
+| Extra `messages(room_id, created_at)` index | ✅ | ❌ |
+| Cable: one frame per broadcast, per-stream index | ✅ | ✅ |
+| Cable: `permessage-deflate` compressed once | ✅ | ❌ |
+| All cores used | ✅ threads | ✅ processes |
+
 ## Known differences
 
 - TLS terminates at a configured proxy.
