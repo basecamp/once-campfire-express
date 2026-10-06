@@ -1,0 +1,1 @@
+<%~ partials.layout_start(dot) %><%~ partials.messages(dot) %><%~ partials.layout_end(dot) %>

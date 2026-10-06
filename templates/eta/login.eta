@@ -1,0 +1,8 @@
+<%~ partials.layout_start(dot) %>
+<section class="txt-align-center"><div class="panel <% if (dot?.Error) { %>shake<% } %>"><figure class="account-logo avatar center margin-block-end txt-xx-large"><img src="/account/logo?v=<%= versionTime(dot?.Account?.UpdatedAt) %>" alt="Account logo" width="300" height="300"></figure>
+<form class="flex flex-column gap" action="<%= dot?.Origin %>/session" accept-charset="UTF-8" method="post"><fieldset class="flex flex-column gap center-block upad"><legend class="txt-large txt-align-center"><strong><%= dot?.Account?.Name %></strong></legend>
+<div class="flex align-center gap"><%= translate("email_address") %><label class="flex align-center gap input input--actor txt-large"><input required="required" class="input" autofocus="autofocus" autocomplete="username" placeholder="Enter your email address" value="<%= dot?.Email %>" type="email" name="email_address" id="email_address"><img aria-hidden="true" class="colorize--black" src="<%= asset("email.svg") %>" width="24" height="24"></label></div>
+<div class="flex align-center gap"><%= translate("password") %><label class="flex align-center gap input input--actor txt-large"><input required="required" class="input" autocomplete="current-password" placeholder="Enter your password" maxlength="72" type="password" name="password" id="password"><img aria-hidden="true" class="colorize--black" src="<%= asset("password.svg") %>" width="24" height="24"></label></div>
+<button name="log_in" type="submit" class="btn btn--reversed center txt-large"><img aria-hidden="true" src="<%= asset("arrow-right.svg") %>"><span class="for-screen-reader">Go</span></button></fieldset></form></div>
+<%~ partials.help_contact(dot) %></section>
+<%~ partials.layout_end(dot) %>

@@ -1,0 +1,1 @@
+<%~ partials.layout_start(dot) %><div id="message-area" class="message-area"><div class="message-area--empty min-width center"><figure class="center pad"><img src="<%= asset("messages-empty.svg") %>" aria-hidden="true" class="colorize--black translucent"><span class="for-screen-reader"><%= dot?.User?.Name %></span></figure></div></div><%~ partials.layout_end(dot) %>
