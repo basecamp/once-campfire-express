@@ -1049,3 +1049,21 @@ test("sidebar direct rows are cached per membership version, as in Rails", async
     await http.close();
   }
 });
+
+test("the sidebar endpoint renders a complete page and preserves the authenticated viewer", () => {
+  const body = render(
+    {
+      user: admin,
+      protocol: "http",
+      get: (name) => (name === "host" ? "example.test" : undefined),
+    },
+    "sidebar",
+  );
+  assert.match(body, /<!DOCTYPE html>/);
+  assert.match(
+    body,
+    new RegExp(`name="current-user-id" content="${admin.id}"`),
+  );
+  assert.match(body, /id="user_sidebar"/);
+  assert.match(body, /<\/html>/);
+});
