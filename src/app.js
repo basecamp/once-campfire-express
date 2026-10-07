@@ -2,6 +2,7 @@ import express from "express";
 import compression from "compression";
 import { splicedGzip } from "./gzip.js";
 import { frontCacheMiddleware } from "./front_cache.js";
+import { beginPage, responseCache } from "./response_cache.js";
 import multer from "multer";
 import path from "node:path";
 import fs from "node:fs";
@@ -45,6 +46,8 @@ export function authenticateCookies(header, cookies = parseCookies(header)) {
   }
 }
 function sessionMiddleware(req, res, next) {
+  if (responseCache.budget && ["GET", "HEAD"].includes(req.method))
+    beginPage(req);
   validateQueryCacheForTurn();
   req.cookies = parseCookies(req.headers.cookie);
   req.session = {};

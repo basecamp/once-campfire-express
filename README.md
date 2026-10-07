@@ -96,10 +96,12 @@ with four hardware cores allocated to each app.
   `fresh_when @messages`).
 - Action Cable authorization is memoized for `CABLE_AUTH_TTL_MS` (default 1000).
   Every publication checks the database generation; local and external revocations invalidate the authorization memo immediately.
-- Opt-in whole-page response cache per worker (`CAMPFIRE_RESPONSE_CACHE_MB`, default 0 =
-  off) for GET HTML: room, permalink, messages page, sidebar, search, show-message.
-  Any committed write to the main DB, from any process, invalidates all entries. Rails has
-  no equivalent; output is unchanged.
+- Whole-page response cache per worker (`CAMPFIRE_RESPONSE_CACHE_MB`, default 64 MiB,
+  0 disables it) for room, permalink, messages, sidebar, search and show-message HTML.
+  Session and access checks run on every request; any main-DB commit, including one from
+  another process, invalidates entries. Request variants remain separate, and cookies
+  and security headers stay fresh. GET and HEAD share completed HTML/gzip bodies without
+  changing their content or validators. Flash-bearing responses bypass the cache.
 - Large HTML is gzip, not brotli: spliced from cached deflate pieces (`CAMPFIRE_GZIP_CACHE_MB`,
   default 32) or built once per cached page. Digested assets are served from precompressed
   `.br`/`.gz` files built by `bin/build-assets.js`; the file set is read at startup.

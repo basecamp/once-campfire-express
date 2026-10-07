@@ -20,8 +20,7 @@ class Page {
   }
 }
 
-// Byte-bounded LRU of whole rendered HTML pages, off unless CAMPFIRE_RESPONSE_CACHE_MB is set
-// (neither Rails nor the Rust port caches whole pages). Entries are valid for one database epoch only:
+// Byte-bounded LRU of completed HTML and gzip representations. Entries are valid for one database epoch only:
 // the first lookup under a new epoch drops them all, since none can be served again.
 export class ResponseCache {
   #entries = new Map();
@@ -68,7 +67,12 @@ export class ResponseCache {
   }
 
   set(key, epoch, page) {
-    if (epoch !== this.#epoch || page.bytes.length > this.maxEntry) return;
+    if (
+      epoch !== this.#epoch ||
+      page.bytes.length > this.maxEntry ||
+      key.length > 8192
+    )
+      return;
     const replaced = this.#entries.get(key);
     if (replaced) this.#drop(key, replaced);
     page.key = key;
@@ -105,8 +109,10 @@ export class ResponseCache {
 }
 
 export function budgetFromEnv(value) {
-  const mb = value === undefined || value === "" ? NaN : Number(value);
-  return Math.floor((Number.isFinite(mb) && mb > 0 ? mb : 0) * 1024 * 1024);
+  const mb = value === undefined || value === "" ? 64 : Number(value);
+  return Math.floor(
+    (Number.isFinite(mb) && mb > 0 ? Math.min(mb, 1024) : 0) * 1024 * 1024,
+  );
 }
 
 export const responseCache = new ResponseCache(
@@ -164,6 +170,12 @@ export function pageKey(req, tag) {
     req.format ?? "",
     req.get("turbo-frame") ?? "",
     req.get("accept") ?? "",
+    req.get("origin") ?? "",
+    req.get("user-agent") ?? "",
+    req.get("cookie") ?? "",
+    req.currentSession?.id ?? 0,
+    req.csrfToken ?? "",
+    req.session?._csrf_token ?? "",
     req.user?.id ?? 0,
     req.authenticatedByBot ? 1 : 0,
     req.session?.last_room_id ?? "",
@@ -207,13 +219,21 @@ const hasBody = (req) =>
       : req.body.length > 0));
 
 export function sendCachedPage(req, res, tag, produce, cache = responseCache) {
-  if (req.method !== "GET" || !cache.budget || hasBody(req)) {
+  if (
+    !["GET", "HEAD"].includes(req.method) ||
+    !cache.budget ||
+    hasBody(req) ||
+    req.session?.flash ||
+    req.authenticatedByBot
+  ) {
     const html = produce();
     return html === undefined ? undefined : res.type("html").send(html);
   }
   const epoch = req.pageEpoch ?? pageEpoch();
   const key = pageKey(req, tag);
-  const hit = cache.get(key, epoch);
+  // A commit during authentication or authorization must not promote old reads to a newer epoch.
+  const unchanged = pageEpoch() === epoch;
+  const hit = unchanged ? cache.get(key, epoch) : undefined;
   if (hit) return sendPage(req, res, hit);
   const html = produce();
   if (html === undefined) return;
@@ -223,8 +243,11 @@ export function sendCachedPage(req, res, tag, produce, cache = responseCache) {
     res.get("ETag") || (req.app.enabled("etag") ? fastEtag(bytes) : undefined),
   );
   if (
+    req.method === "GET" &&
     res.statusCode === 200 &&
     !res.get("Set-Cookie") &&
+    !res.get("Content-Encoding") &&
+    !/\b(?:no-store|no-transform)\b/i.test(res.get("Cache-Control") || "") &&
     pageEpoch() === epoch &&
     middlewareRowsCurrent(req)
   )
