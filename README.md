@@ -44,6 +44,9 @@ with four hardware threads allocated to each app.
 
 ## Known differences
 
+- Cached message copy-link buttons store paths and resolve them against the current page,
+  keeping copied links absolute without embedding a request host in shared markup.
+
 - Search selects the newest 100 matching messages by insertion ID, then displays them in ID order. Backdated messages can appear in a different order from the original Rails app.
 
 - TLS terminates at a configured proxy.

@@ -1,1 +1,1 @@
-<%~ partials.layout_start(dot) %><form action="/session/transfers/<%= dot?.Transfer %>" method="post" data-controller="auto-submit"><input type="hidden" name="_method" value="put"><%~ partials.layout_end(dot) %>
+<%~ partials.layout_start(dot) %><form action="/session/transfers/<%= dot?.Transfer %>" method="post" data-controller="auto-submit"><input type="hidden" name="_method" value="put"></form><%~ partials.layout_end(dot) %>

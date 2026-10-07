@@ -325,11 +325,7 @@ export function registerRoutes(app) {
   });
   app.all("/session/transfers/:id", (req, res) => {
     if (req.method === "GET")
-      return res
-        .type("html")
-        .send(
-          `<form method="post"><input name="_method" value="put" type="hidden"><button>Sign in to Campfire</button></form>`,
-        );
+      return send(req, res, "transfer", { Transfer: req.params.id });
     if (!["PUT", "PATCH"].includes(req.method)) return res.sendStatus(405);
     let id;
     try {
@@ -363,7 +359,6 @@ export function registerRoutes(app) {
           Room: roomData(room, req.user),
           Messages: cachedMessages(
             messagesForRoom(room.id, { around: req.params.messageId }),
-            origin(req),
           ),
           LoadedAt: epoch(room.updated_at),
           Stream: rails.signStream(rails.stream(room)),
@@ -469,7 +464,7 @@ export function registerRoutes(app) {
                 res.set("ETag", messagesEtag(keys));
                 if (req.fresh) return void res.status(304).end();
                 return fragment("messages", {
-                  Messages: cachedMessages(rows, "", keys),
+                  Messages: cachedMessages(rows, keys),
                 });
               });
         const rows = message ? [message] : messagesForRoom(room.id, req.query);

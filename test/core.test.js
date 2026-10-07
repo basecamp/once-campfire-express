@@ -896,12 +896,11 @@ test("room HTML reflects edits, boosts and attachments within one frozen millise
     assert.ok(!html.includes("first-fragment.txt"));
 
     html = await http.page(path, { host: "evil.test" });
-    const permalink = (host) =>
-      `data-copy-to-clipboard-content-value="http://${host}/rooms/${open.id}/@${message.id}"`;
-    assert.ok(html.includes(permalink("evil.test")), "e: host permalink");
+    const permalink = `data-copy-to-clipboard-url-value="/rooms/${open.id}/@${message.id}"`;
+    assert.ok(html.includes(permalink), "e: host-independent permalink");
     html = await room();
     assert.ok(!html.includes("evil.test"), "e: host must not leak");
-    assert.ok(html.includes(permalink(http.host)));
+    assert.ok(html.includes(permalink));
   } finally {
     await http.close();
     if (frozen === undefined) delete process.env.CAMPFIRE_FROZEN_TIME;
@@ -1175,4 +1174,30 @@ test("search finds sparse memberships behind newer inaccessible matches", () => 
   domain.grantMemberships(open, [outsider.id]);
   assert.deepEqual(domain.searchMessages(outsider, "searchsparseonly AND"), []);
   assert.equal(domain.searchMessages(admin, "searchsparseonly").length, 100);
+});
+
+test("transfer landing page loads the automatic submit controller without creating a session on GET", async () => {
+  const server = createServer(createApp());
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const before = get("SELECT COUNT(*) n FROM sessions").n;
+  try {
+    const token = rails.signedId(
+      "User",
+      member.id,
+      "transfer",
+      new Date(Date.now() + 60000).toISOString(),
+    );
+    const response = await fetch(
+      `http://127.0.0.1:${server.address().port}/session/transfers/${token}`,
+    );
+    const html = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(html, /data-controller="auto-submit"/);
+    assert.match(html, /<script type="importmap"/);
+    assert.match(html, /name="_method" value="put"/);
+    assert.match(html, /<\/form>/);
+    assert.equal(get("SELECT COUNT(*) n FROM sessions").n, before);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
