@@ -237,6 +237,8 @@ test("publishMessage delivers the room event then one unread event per member", 
   await wait(() => frames.some((f) => f.message?.roomId === 1));
   const delivered = frames.filter((f) => f.message);
   assert.match(delivered[0].message, /batched hello/);
+  // Appends use the messages controller's own scrolling; nesting maintain-scroll prevents insertion.
+  assert.doesNotMatch(delivered[0].message, /maintain_scroll/);
   assert.deepEqual(delivered[1].message, { roomId: 1 });
   ws.close();
   await once(ws, "close");

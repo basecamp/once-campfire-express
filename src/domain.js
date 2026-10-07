@@ -347,7 +347,7 @@ export function publishMessage(message, action = "append") {
   const events = [
     {
       stream: stream(room),
-      message: `<turbo-stream action="${action}" target="${target}" maintain_scroll="true"><template>${html}</template></turbo-stream>`,
+      message: `<turbo-stream action="${action}" target="${target}"><template>${html}</template></turbo-stream>`,
     },
   ];
   if (action === "append")
