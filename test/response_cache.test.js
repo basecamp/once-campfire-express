@@ -467,7 +467,7 @@ test("message cache keys follow updated_at, which every edit moves even in one f
       "<p>dddd</p>",
       message.id,
     );
-    assert.equal(key(), third, "keys never read bodies; writers touch");
+    assert.notEqual(key(), third, "observed writes also namespace unchanged timestamps");
   } finally {
     if (frozen === undefined) delete process.env.CAMPFIRE_FROZEN_TIME;
     else process.env.CAMPFIRE_FROZEN_TIME = frozen;
@@ -709,5 +709,47 @@ test("flash-bearing pages bypass lookup and admission", async () => {
     assert.equal(renders, 3);
   } finally {
     await new Promise((resolve) => local.close(resolve));
+  }
+});
+
+test("foreign edits without timestamps invalidate nested message fragments", async () => {
+  const message = domain.createMessage(
+    open.id,
+    member.id,
+    "<p>original nested body</p>",
+  );
+  const path = `/rooms/${open.id}`;
+  await page(path);
+  await page(path);
+  const foreign = openDatabase(databaseFile());
+  try {
+    foreign
+      .prepare(
+        "UPDATE action_text_rich_texts SET body=? WHERE record_type='Message' AND record_id=?",
+      )
+      .run("<p>foreign nested body</p>", message.id);
+    let fresh = await page(path);
+    assert.match(fresh.body.toString(), /foreign nested body/);
+    assert.doesNotMatch(fresh.body.toString(), /original nested body/);
+    foreign
+      .prepare("UPDATE users SET name=? WHERE id=?")
+      .run("Foreign fragment creator", member.id);
+    fresh = await page(path);
+    assert.match(fresh.body.toString(), /Foreign fragment creator/);
+    foreign
+      .prepare(
+        "INSERT INTO boosts(booster_id,content,created_at,message_id,updated_at) VALUES(?,?,?,?,?)",
+      )
+      .run(admin.id, "🍊", now(), message.id, now());
+    fresh = await page(path);
+    assert.match(fresh.body.toString(), /🍊/);
+    foreign
+      .prepare("UPDATE boosts SET content=? WHERE message_id=?")
+      .run("🍋", message.id);
+    fresh = await page(path);
+    assert.match(fresh.body.toString(), /🍋/);
+    assert.doesNotMatch(fresh.body.toString(), /🍊/);
+  } finally {
+    foreign.close();
   }
 });

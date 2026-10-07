@@ -83,11 +83,11 @@ with four hardware cores allocated to each app.
   default 32) keyed like Rails/Rust: template digest, id, `updated_at`, `presentation-v3`,
   plus origin (permalinks embed the host). Body edits, attachment changes and boosts touch
   `messages.updated_at` with strictly increasing microsecond values (also under
-  `CAMPFIRE_FROZEN_TIME`). Creator/booster/room renames and @mention names stay stale until
-  the message changes, as in Rails/Rust.
+  `CAMPFIRE_FROZEN_TIME`). An observed DB generation also namespaces fragments, so
+  related-user changes and external edits without timestamp updates refresh their HTML.
 - Sidebar direct-room rows share that cache, keyed by membership id/`updated_at` plus the
-  room's `updated_at` and unread flag; member renames/avatars stay stale until the
-  membership changes, as in Rails/Rust.
+  room's `updated_at`, unread flag and observed DB generation; member changes refresh
+  their HTML even without touching the membership.
 - Thruster-style in-memory cache (`CAMPFIRE_FRONT_CACHE_MB`, default 64, items ≤ 1 MB) for
   GET/HEAD responses with `public` and a positive max-age (avatars, assets): keyed by
   method, URL, host and `Vary` headers, Set-Cookie stripped, `X-Cache: hit|miss|bypass`,

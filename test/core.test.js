@@ -786,7 +786,7 @@ async function httpSession(user, token) {
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }
-test("room HTML reflects edits, boosts and attachments within one frozen millisecond, keeps renames until the message changes, and never leaks hosts", async () => {
+test("room HTML reflects edits, boosts and attachments within one frozen millisecond, reflects related renames, and never leaks hosts", async () => {
   // Frozen time puts every write in one millisecond; touches must still move updated_at.
   const frozen = process.env.CAMPFIRE_FROZEN_TIME;
   process.env.CAMPFIRE_FROZEN_TIME = "2026-01-02T03:04:05.678Z";
@@ -846,10 +846,12 @@ test("room HTML reflects edits, boosts and attachments within one frozen millise
     try {
       html = await room();
       assert.ok(
-        html.includes("Admin boosted Fragboost again"),
-        "c: renames alone keep the cached message, as in Rails",
+        html.includes("Booster Renamed boosted Fragboost again"),
+        "c: related renames invalidate cached fragments",
       );
-      assert.ok(html.includes("Fragment Author"));
+      assert.ok(
+        html.includes('<strong data-reply-target="author">Renamed</strong>'),
+      );
       domain.updateMessage(
         domain.messageById(message.id),
         "<p>Edited fragment body</p>",
@@ -1006,7 +1008,7 @@ test("fastEtag is stable per body, weak, and differs between bodies", async () =
   assert.notEqual(fastEtag(a), fastEtag(b));
 });
 
-test("sidebar direct rows are cached per membership version, as in Rails", async () => {
+test("sidebar direct rows also invalidate on related-user writes", async () => {
   const http = await httpSession(member, "sidebar-direct-session");
   try {
     const t = now();
@@ -1033,8 +1035,8 @@ test("sidebar direct rows are cached per membership version, as in Rails", async
       peer.id,
     );
     assert.ok(
-      (await sidebar()).includes("Ping with</span>Zed</span>"),
-      "a rename alone keeps the cached row",
+      (await sidebar()).includes("Ping with</span>Yann</span>"),
+      "a rename invalidates the cached row",
     );
     domain.createMessage(direct.id, peer.id, "<p>hello</p>");
     const html = await sidebar();

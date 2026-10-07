@@ -101,7 +101,12 @@ const queryCache = new Map();
 let hits = 0,
   misses = 0,
   seenDataVersion;
-export const clearQueryCache = () => queryCache.clear();
+let renderGeneration = 0;
+export const renderEpoch = () => renderGeneration;
+export const clearQueryCache = () => {
+  queryCache.clear();
+  renderGeneration++;
+};
 export const queryCacheStats = () => ({
   size: queryCache.size,
   hits,
@@ -111,7 +116,7 @@ export const queryCacheStats = () => ({
 function validateQueryCache() {
   const { data_version } = statement("PRAGMA data_version").get();
   if (data_version !== seenDataVersion) {
-    queryCache.clear();
+    clearQueryCache();
     seenDataVersion = data_version;
   }
 }

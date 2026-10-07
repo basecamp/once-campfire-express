@@ -1,7 +1,7 @@
 import { Eta } from "eta";
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { all, get } from "./db.js";
+import { all, get, renderEpoch } from "./db.js";
 import * as rails from "./rails.js";
 import { escape, plainText, renderBody } from "./richtext.js";
 import { blobUrl, representationUrl } from "./storage.js";
@@ -209,12 +209,12 @@ const templateDigest = templateSources
 
 // Like Rails' `cache message` (the Rust port's `presentation-v3` key): the message's id and
 // updated_at, which every write that changes its HTML touches. Copy links resolve paths in
-// the browser. Renames of the creator, boosters, room or @mentioned users are not
-// keyed, so existing messages keep the old names until they change, as in Rails.
+// the browser. The observed DB generation also namespaces fragments, so external writes
+// without timestamp changes and related-user renames cannot retain stale HTML.
 export function messageCacheKeys(rows) {
   return rows.map(
     (m) =>
-      `views/messages/_message:${templateDigest}/messages/${m.id}-${m.updated_at}/presentation-v3`,
+      `epoch:${renderEpoch()}/views/messages/_message:${templateDigest}/messages/${m.id}-${m.updated_at}/presentation-v3`,
   );
 }
 
@@ -223,7 +223,7 @@ export function messageCacheKeys(rows) {
 export function cachedSidebarDirects(rooms, user, membersFor) {
   const keys = rooms.map(
     (r) =>
-      `views/sidebar_direct:${templateDigest}/memberships/${r.membership_id}-${r.membership_updated_at}/${r.updated_at}/${r.unread_at ? 1 : 0}`,
+      `epoch:${renderEpoch()}/views/sidebar_direct:${templateDigest}/memberships/${r.membership_id}-${r.membership_updated_at}/${r.updated_at}/${r.unread_at ? 1 : 0}`,
   );
   const missing = rooms.filter((_, i) => !messageFragments.has(keys[i]));
   const members = missing.length ? membersFor(missing.map((r) => r.id)) : null;
