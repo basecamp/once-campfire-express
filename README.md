@@ -44,6 +44,9 @@ with four hardware threads allocated to each app.
 
 ## Known differences
 
+- Sidebar connection refresh waits for the current Turbo frame to finish loading,
+  preventing an aborted response on startup or reconnect. Obsolete connections and removed frames do not reload.
+
 - Cached message copy-link buttons store paths and resolve them against the current page,
   keeping copied links absolute without embedding a request host in shared markup.
 
