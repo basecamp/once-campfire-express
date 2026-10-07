@@ -1,6 +1,6 @@
 # Benchmarks
 
-Ruby orchestrates fresh production containers of Express on Node 24 (`express`) and the
+Ruby orchestrates fresh production containers of this Fastify app on Node 24 (app id `express`) and the
 [Rust port](https://github.com/basecamp/once-campfire-rust), alternating their order.
 Both the seed and the load generator come from a sibling `once-campfire-rust` checkout,
 and this repository is expected at the sibling path `once-campfire-express`:

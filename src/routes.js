@@ -48,6 +48,7 @@ import {
   purgeBlob,
 } from "./storage.js";
 import { enqueue, afterResponse } from "./jobs.js";
+import { htmlType, isFresh } from "./gzip.js";
 const token = () => randomBytes(18).toString("base64url");
 // Mirrors messagesForRoom(): a new message can change the window only if it sorts at or before
 // `until`, the before= anchor or the newest row of a full upward page. An unanchored window, or an
@@ -68,14 +69,14 @@ function windowTail(room, rows, { before, after, around } = {}) {
 }
 const messagesEtag = (keys) =>
   `W/"${createHash("sha1").update(keys.join("|")).digest("hex")}"`;
-const origin = (req) => `${req.protocol}://${req.get("host")}`;
+const origin = (req) => `${req.protocol}://${req.headers.host}`;
 export function value(req, group, key, fallback = "") {
   const result =
     req.body?.[group]?.[key] ?? req.body?.[`${group}[${key}]`] ?? fallback;
   return Array.isArray(result) ? result.at(-1) : result;
 }
 const send = (req, res, screen, data = {}) =>
-  res.type("html").send(render(req, screen, data));
+  res.type(htmlType).send(render(req, screen, data));
 const can = (user, row) => user.role === 1 || row.creator_id === user.id;
 function login(req, res, next) {
   if (!req.user) {
@@ -99,7 +100,7 @@ function startSession(req, user) {
     "INSERT INTO sessions(user_id,token,user_agent,ip_address,last_active_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
     user.id,
     t,
-    req.get("user-agent") || "",
+    req.headers["user-agent"] || "",
     req.ip || "",
     time,
     time,
@@ -108,7 +109,7 @@ function startSession(req, user) {
   req.user = user;
   req.newSessionToken = t;
 }
-const file = (req, name) => req.files?.find((f) => f.fieldname === name);
+const file = (req, name) => req.uploads?.find((f) => f.fieldname === name);
 function attachment(req) {
   return (
     file(req, "message[attachment]") ||
@@ -208,7 +209,7 @@ export function serializeMessage(m, req) {
 }
 const turbo = (res, action, target, body = "") =>
   res
-    .type("text/vnd.turbo-stream.html")
+    .type("text/vnd.turbo-stream.html; charset=utf-8")
     .send(
       `<turbo-stream action="${action}" target="${target}"><template>${body}</template></turbo-stream>`,
     );
@@ -248,7 +249,7 @@ export function registerRoutes(app) {
     )
       return res
         .status(401)
-        .type("html")
+        .type(htmlType)
         .send(
           render(req, "login", {
             Error: "Too many requests or unauthorized.",
@@ -342,7 +343,7 @@ export function registerRoutes(app) {
   app.all("/session/transfers/:id", (req, res) => {
     if (req.method === "GET")
       return res
-        .type("html")
+        .type(htmlType)
         .send(
           `<form method="post"><input name="_method" value="put" type="hidden"><button>Sign in to Campfire</button></form>`,
         );
@@ -455,7 +456,7 @@ export function registerRoutes(app) {
       const json =
         isBot ||
         req.format === "json" ||
-        req.accepts(["html", "json"]) === "json" ||
+        req.type(["html", "json"]) === "json" ||
         req.path.endsWith(".json");
       if (req.method === "GET") {
         if (req.path.endsWith("/edit")) {
@@ -491,8 +492,8 @@ export function registerRoutes(app) {
                   tail: windowTail(room.id, rows, req.query),
                 });
                 const keys = messageCacheKeys(rows);
-                res.set("ETag", messagesEtag(keys));
-                if (req.fresh) return void res.status(304).end();
+                res.header("ETag", messagesEtag(keys));
+                if (isFresh(req, res)) return void res.status(304).send();
                 return fragment("messages", {
                   Messages: cachedMessages(rows, "", keys),
                 });
@@ -500,7 +501,7 @@ export function registerRoutes(app) {
         const rows = message ? [message] : messagesForRoom(room.id, req.query);
         if (!rows.length) return res.sendStatus(204);
         if (isBot) {
-          res.set(
+          res.header(
             "X-Total-Count",
             String(
               get("SELECT count(*) AS n FROM messages WHERE room_id=?", room.id)
@@ -516,12 +517,12 @@ export function registerRoutes(app) {
               anchor.created_at,
             )
           )
-            res.set(
+            res.header(
               "Link",
               `<${origin(req)}/rooms/${room.id}/${req.params.botKey}/messages?${direction}=${anchor.id}>; rel="next"`,
             );
         }
-        return res.json(
+        return res.send(
           message
             ? serializeMessage(message, req)
             : rows.map((m) => serializeMessage(m, req)),
@@ -556,19 +557,19 @@ export function registerRoutes(app) {
           throw error;
         }
         const html = publishMessage(message);
-        afterResponse(res, () => notifyMessage(message));
+        afterResponse(res.raw, () => notifyMessage(message));
         if (isBot)
           return res
             .status(201)
-            .set(
+            .header(
               "Location",
               `${origin(req)}/rooms/${room.id}/messages/${message.id}`,
             )
-            .end();
+            .send();
         if (json)
           return res
             .status(201)
-            .json(serializeMessage(messageById(message.id), req));
+            .send(serializeMessage(messageById(message.id), req));
         return turbo(
           res,
           "append",
@@ -593,7 +594,7 @@ export function registerRoutes(app) {
         for (const id of obsolete || []) enqueue("purge", { blob_id: id });
         publishMessage(message, "replace");
         return json
-          ? res.json(serializeMessage(message, req))
+          ? res.send(serializeMessage(message, req))
           : res.redirect(`/rooms/${room.id}/messages/${message.id}`);
       }
       if (req.method === "DELETE") {
@@ -614,7 +615,7 @@ export function registerRoutes(app) {
     )
       .filter((m) => epoch(m.updated_at) > since)
       .slice(-80);
-    res.type("text/vnd.turbo-stream.html").send(
+    res.type("text/vnd.turbo-stream.html; charset=utf-8").send(
       messages
         .map((m) => {
           const action = epoch(m.created_at) > since ? "append" : "replace",
@@ -875,7 +876,7 @@ function registerBoosts(app) {
           `<turbo-stream action="append" target="boosts_message_${message.client_message_id}" maintain_scroll="true"><template>${fragment("boost", boost)}</template></turbo-stream>`,
         );
         if (bot)
-          return res.status(201).json({
+          return res.status(201).send({
             id,
             content,
             created_at: iso(time),
@@ -952,8 +953,8 @@ function registerUsers(app) {
     users = users
       .filter((u) => u.name.toLowerCase().includes(query))
       .slice(0, 20);
-    if (req.accepts(["html", "json"]) === "json")
-      return res.json(
+    if (req.type(["html", "json"]) === "json")
+      return res.send(
         users.map((u) => ({
           id: u.id,
           name: escape(u.name),
@@ -964,7 +965,7 @@ function registerUsers(app) {
           value: u.id,
         })),
       );
-    res.type("html").send(
+    res.type(htmlType).send(
       users
         .map((u) =>
           fragment("prompt-item", {

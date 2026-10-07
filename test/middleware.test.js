@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import http from "node:http";
 process.env.DATABASE_PATH = ":memory:";
 process.env.SECRET_KEY_BASE = "native-session-integer-tests";
-const { createApp } = await import("../src/app.js");
+const { createServer: createAppServer } = await import("../src/app.js");
 const rails = await import("../src/rails.js");
 test("HTTP middleware preserves a large integer in a real encrypted Rails session", async () => {
-  const server = http.createServer(createApp());
+  const server = await createAppServer();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
     const cookie = rails.encryptCookie("_campfire_session", {

@@ -1,6 +1,6 @@
 # once-campfire-express
 
-ONCE Campfire implemented natively with Node.js 24 (`node:sqlite`) and Express 5. The existing SQLite
+ONCE Campfire implemented natively with Node.js 24 (`node:sqlite`) and Fastify 5. The existing SQLite
 schema, uploaded files, bcrypt passwords and Rails login cookies remain compatible.
 Eta templates (`templates/eta/`, converted byte for byte from the former nunjucks macros by
 `bin/nunjucks-to-eta.js`) render the retained Turbo/Stimulus/Lexxy frontend; native WebSockets
@@ -45,16 +45,17 @@ At 100 WebSocket connections and five messages/second, median delivery to every
 connection was 24 ms for Rails and 14 ms for Express. Every message reached every
 connection in both runs.
 
-The table above predates the caching work below. A later matched run on a 16-thread x86-64
+The tables here were measured while the HTTP layer was Express 5, before the move to Fastify.
+The first table also predates the caching work below. A later matched run on a 16-thread x86-64
 host (same harness, 16 clients, servers on 4 hardware threads) measured this branch (the first column is `main` before these changes, same host):
 
-| HTTP workload (requests/sec) | Node 24 before caching | Express on Node 24 | Rust |
+| HTTP workload (requests/sec) | Node 24 + Express before caching | Node.js 24 + Fastify | Rust |
 |---|---:|---:|---:|
-| Room page | 395 | 19,362 | 19,386 |
-| Messages page | 546 | 29,226 | 21,474 |
-| Sidebar | 3,059 | 39,350 | 18,521 |
-| Search | 935 | 34,657 | 19,000 |
-| Post a message | 124 | 1,769 | 4,503 |
+| Room page | 395 | 21,632 | 19,121 |
+| Messages page | 546 | 32,399 | 21,336 |
+| Sidebar | 3,059 | 45,509 | 17,702 |
+| Search | 935 | 42,285 | 18,222 |
+| Post a message | 124 | 1,914 | 4,346 |
 
 Reads hit the whole-page response cache because the read benchmark performs no concurrent
 writes. After a commit, cached pages are revalidated rather than dropped, so writes to other
@@ -63,7 +64,7 @@ rooms keep them; this and the in-memory asset cache are not covered by `npm run 
 Optimizations compared with the Rust port (🟡 = partial; the extra index is omitted to keep
 the original schema):
 
-| Optimization | Rust | Express |
+| Optimization | Rust | Node.js + Fastify |
 |---|:---:|:---:|
 | Message fragment cache (Rails `cache message`) | ✅ | ✅ |
 | Whole-page response cache | ❌ | ✅ |
@@ -87,6 +88,16 @@ the original schema):
 ## Known differences
 
 - TLS terminates at a configured proxy.
+- HTTP runs on Fastify 5 (`@fastify/static`, `@fastify/multipart`, `@fastify/compress`,
+  `@fastify/cookie`, `@fastify/accepts`; `qs` for query strings and form bodies) instead of
+  Express 5. Routes, statuses, redirects, cookies, CSRF, uploads and caching are functionally
+  unchanged; bytes are not: redirects carry no body, header names are lowercase, string
+  bodies without a type default to `text/plain`, and ETags of non-page bodies are
+  `W/"<length>-<crc32>"` instead of Express's SHA-1. A form's `_method` is honoured by
+  `src/router.js`, which also keeps Express's ordered `next()` fall-through between
+  same-shaped routes (`/rooms/:kind` before `/rooms/:roomId`). `/up//` gets 403 from the
+  static fallback where Express answered 404. Verified by `npm test` and a seed smoke run
+  (single and cluster workers); not re-benchmarked.
 - CSRF: `Sec-Fetch-Site` replaces tokens. Writes accept `same-origin` and `same-site`,
   reject `cross-site`, `none` and missing headers over HTTPS with 422, and retain the
   `Origin` check. Plain HTTP accepts missing headers with `SameSite=Lax` cookies. Pages omit
@@ -136,12 +147,12 @@ the original schema):
   `.br`/`.gz` files built by `bin/build-assets.js`; the file set is read at startup.
 - Public responses are kept in memory per worker (`CAMPFIRE_PUBLIC_CACHE_MB`, default 32, 0
   disables; LRU): each digested asset variant (identity/br/gzip) with prebuilt headers is answered
-  before Express, and avatar bodies are keyed by their ETag, which covers user name,
+  before Fastify, and avatar bodies are keyed by their ETag, which covers user name,
   `updated_at` and avatar blob, so changes show on the next request. A file is read on its
   first request (served from disk meanwhile) and never re-read (files over half the budget
   are never read, and ones resized since startup never stored). Range, `If-Match`,
   `If-Unmodified-Since` and on-the-fly-compressed requests keep the file-serving chain, whose
-  status, headers and bytes the cache reproduces.
+  status, bytes and client-relevant headers the cache reproduces.
 - `/up` answers before the session middleware, as Rails' health controller does: no
   `_campfire_session` cookie, ban check or `last_active_at` update. Matched paths, body and ETag
   are unchanged.

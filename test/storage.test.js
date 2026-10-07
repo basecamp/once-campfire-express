@@ -196,20 +196,29 @@ test("native backup/restore preserves database and storage bytes", async () => {
   );
   assert.throws(() => restoreBackup(archive, dest), /empty/);
 });
-test("signed direct upload enforces checksum, actual ranges, draft ownership and private membership", async () => {
-  const express = (await import("express")).default;
-  const rails = await import("../src/rails.js");
-  const app = express();
-  app.use(express.json());
-  app.use((req, res, next) => {
-    req.user = req.headers["x-user"]
-      ? { id: Number(req.headers["x-user"]) }
-      : null;
-    next();
+// Storage routes on a bare Fastify app: JSON bodies parsed, every other body kept as raw bytes.
+async function storageApp(user) {
+  const { listenApp } = await import("./fastify_app.js");
+  const { routeTable } = await import("../src/router.js");
+  return listenApp((app) => {
+    app.removeContentTypeParser("text/plain");
+    app.addContentTypeParser("*", { parseAs: "buffer" }, (req, body, done) =>
+      done(null, body),
+    );
+    app.addHook("preHandler", (req, reply, done) => {
+      req.user = user(req);
+      done();
+    });
+    const routes = routeTable(app);
+    storage.registerStorage(routes);
+    routes.register();
   });
-  storage.registerStorage(app);
-  const server = app.listen(0, "127.0.0.1");
-  await new Promise((r) => server.once("listening", r));
+}
+test("signed direct upload enforces checksum, actual ranges, draft ownership and private membership", async () => {
+  const rails = await import("../src/rails.js");
+  const server = await storageApp((req) =>
+    req.headers["x-user"] ? { id: Number(req.headers["x-user"]) } : null,
+  );
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     const raw = Buffer.from("0123456789");
@@ -523,7 +532,6 @@ test("actual Rails-issued variation URL renders native JPEG thumbnail", async ()
   // Generated independently with ActiveStorage::Variation.encode in the pinned Rails image, fixed test-only key.
   const variation =
     "eyJfcmFpbHMiOnsiZGF0YSI6eyJmb3JtYXQiOiJqcGciLCJyZXNpemVfdG9fbGltaXQiOlsxMjAwLDgwMF19LCJwdXIiOiJ2YXJpYXRpb24ifX0=--167c4454bfaf9c46eed3049820a1d693a438771a";
-  const express = (await import("express")).default;
   const rails = await import("../src/rails.js");
   assert.deepEqual(rails.verify(variation, "ActiveStorage", "variation"), {
     format: "jpg",
@@ -546,14 +554,7 @@ test("actual Rails-issued variation URL renders native JPEG thumbnail", async ()
     JSON.stringify({ campfire_upload_user_id: 1 }),
     blob.id,
   );
-  const app = express();
-  app.use((req, res, next) => {
-    req.user = { id: 1 };
-    next();
-  });
-  storage.registerStorage(app);
-  const server = app.listen(0, "127.0.0.1");
-  await new Promise((r) => server.once("listening", r));
+  const server = await storageApp(() => ({ id: 1 }));
   try {
     const url = `http://127.0.0.1:${server.address().port}/rails/active_storage/representations/redirect/${rails.signedId("ActiveStorage::Blob", blob.id, "blob_id")}/${variation}/rails.jpg`;
     const response = await fetch(url);

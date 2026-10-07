@@ -4,7 +4,6 @@ import crypto from "node:crypto";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
-import express from "express";
 import sharp from "sharp";
 import { all, get, run, transaction, now } from "./db.js";
 import * as rails from "./rails.js";
@@ -229,18 +228,16 @@ export function serve(req, res, file, type, filename, disposition = "inline") {
   );
   if (!range) return;
   const stream = fs.createReadStream(file, range);
-  stream.on("error", (error) => res.destroy(error));
-  res.on("close", () => stream.destroy());
-  stream.pipe(res);
+  res.send(stream);
 }
 export function serveBytes(req, res, bytes, type, filename) {
   const range = servedRange(req, res, bytes.length, type, filename, "inline");
-  if (range) res.end(bytes.subarray(range.start, range.end + 1));
+  if (range) res.send(bytes.subarray(range.start, range.end + 1));
 }
 // Sets the shared headers and answers HEAD, empty and unsatisfiable requests; otherwise returns
 // the inclusive byte range left to send.
 function servedRange(req, res, size, type, filename, disposition) {
-  res.set({
+  res.headers({
     "Accept-Ranges": "bytes",
     "Content-Type": type,
     "Content-Disposition": `${disposition === "attachment" ? "attachment" : "inline"}; filename="${filename.replace(/[\r\n"\\]/g, "")}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
@@ -250,7 +247,10 @@ function servedRange(req, res, size, type, filename, disposition) {
   if (req.headers.range) {
     const m = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range);
     if (!m || (!m[1] && !m[2]))
-      return void res.status(416).set("Content-Range", `bytes */${size}`).end();
+      return void res
+        .status(416)
+        .header("Content-Range", `bytes */${size}`)
+        .send();
     start = m[1] ? Number(m[1]) : Math.max(0, size - Number(m[2]));
     end = m[1] && m[2] ? Math.min(size - 1, Number(m[2])) : size - 1;
     if (
@@ -259,11 +259,14 @@ function servedRange(req, res, size, type, filename, disposition) {
       start > end ||
       start >= size
     )
-      return void res.status(416).set("Content-Range", `bytes */${size}`).end();
-    res.status(206).set("Content-Range", `bytes ${start}-${end}/${size}`);
+      return void res
+        .status(416)
+        .header("Content-Range", `bytes */${size}`)
+        .send();
+    res.status(206).header("Content-Range", `bytes ${start}-${end}/${size}`);
   }
-  res.set("Content-Length", String(Math.max(0, end - start + 1)));
-  if (req.method === "HEAD" || size === 0) return void res.end();
+  res.header("Content-Length", String(Math.max(0, end - start + 1)));
+  if (req.method === "HEAD" || size === 0) return void res.send();
   return { start, end };
 }
 export function authorizedBlob(blob, user) {
@@ -529,7 +532,7 @@ export function registerStorage(app) {
         "blob_token",
         new Date(Date.now() + 300000),
       );
-      res.json({
+      res.send({
         id,
         key,
         filename: path.basename(data.filename),
@@ -539,7 +542,7 @@ export function registerStorage(app) {
         signed_id: rails.signedId("ActiveStorage::Blob", id, "blob_id"),
         attachable_sgid: rails.sgid("ActiveStorage::Blob", id),
         direct_upload: {
-          url: `${req.protocol}://${req.get("host")}/rails/active_storage/disk/${token}`,
+          url: `${req.protocol}://${req.headers.host}/rails/active_storage/disk/${token}`,
           headers: { "Content-Type": type },
         },
       });
@@ -547,29 +550,25 @@ export function registerStorage(app) {
       res.sendStatus(422);
     }
   });
-  app.put(
-    "/rails/active_storage/disk/:token",
-    express.raw({ type: () => true, limit: "50mb" }),
-    (req, res) => {
-      try {
-        const data = rails.verify(
-          req.params.token,
-          "ActiveStorage",
-          "blob_token",
-        );
-        if (
-          !Buffer.isBuffer(req.body) ||
-          req.body.length !== data.content_length ||
-          checksum(req.body) !== data.checksum
-        )
-          return res.sendStatus(422);
-        write(data.key, req.body);
-        res.status(204).end();
-      } catch {
-        res.sendStatus(404);
-      }
-    },
-  );
+  app.put("/rails/active_storage/disk/:token", (req, res) => {
+    try {
+      const data = rails.verify(
+        req.params.token,
+        "ActiveStorage",
+        "blob_token",
+      );
+      if (
+        !Buffer.isBuffer(req.body) ||
+        req.body.length !== data.content_length ||
+        checksum(req.body) !== data.checksum
+      )
+        return res.sendStatus(422);
+      write(data.key, req.body);
+      res.status(204).send();
+    } catch {
+      res.sendStatus(404);
+    }
+  });
   app.get("/rails/active_storage/disk/:token/{*filename}", (req, res) => {
     try {
       const data = rails.verify(req.params.token, "ActiveStorage", "blob_key");

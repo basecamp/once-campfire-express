@@ -13,7 +13,7 @@ const { run, get, now, initialize, databaseFile } =
 const { openDatabase } = await import("../src/sqlite.js");
 const domain = await import("../src/domain.js");
 const rails = await import("../src/rails.js");
-const { createApp } = await import("../src/app.js");
+const { createServer: createAppServer } = await import("../src/app.js");
 const { messageCacheKeys } = await import("../src/rendering.js");
 const { fastEtag } = await import("../src/gzip.js");
 const { ResponseCache, responseCache, sendCachedPage, budgetFromEnv } =
@@ -75,7 +75,7 @@ before(async () => {
     );
   adminCookie = sessionCookie("admin-session");
   memberCookie = sessionCookie("member-session");
-  server = http.createServer(createApp());
+  server = await createAppServer();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   port = server.address().port;
 });
@@ -316,29 +316,28 @@ test("messages page: weak ETag, 304 on a hit, 204 never cached, search cached", 
 });
 
 test("render runs once per key and epoch; non-200 and HEAD are not cached", async () => {
-  const express = (await import("express")).default;
-  const app = express();
-  app.use((req, res, next) => {
-    req.account = get("SELECT * FROM accounts ORDER BY id LIMIT 1");
-    next();
-  });
+  const { listenApp } = await import("./fastify_app.js");
   const cache = new ResponseCache(1 << 20);
   let renders = 0;
   const html = "<!DOCTYPE html><p>" + "x".repeat(4000) + "</p>";
-  app.get("/page", (req, res) =>
-    sendCachedPage(req, res, "t", () => (renders++, html), cache),
-  );
-  app.get("/created", (req, res) =>
-    sendCachedPage(
-      req,
-      res,
-      "c",
-      () => (renders++, res.status(201), html),
-      cache,
-    ),
-  );
-  const local = http.createServer(app);
-  await new Promise((resolve) => local.listen(0, "127.0.0.1", resolve));
+  const local = await listenApp((app) => {
+    app.addHook("preHandler", (req, res, done) => {
+      req.account = get("SELECT * FROM accounts ORDER BY id LIMIT 1");
+      done();
+    });
+    app.get("/page", (req, res) =>
+      sendCachedPage(req, res, "t", () => (renders++, html), cache),
+    );
+    app.get("/created", (req, res) =>
+      sendCachedPage(
+        req,
+        res,
+        "c",
+        () => (renders++, res.status(201), html),
+        cache,
+      ),
+    );
+  });
   const at = local.address().port;
   const fetchPage = (path, method = "GET") =>
     new Promise((resolve, reject) =>

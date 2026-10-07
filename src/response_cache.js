@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { db, now, writeEpoch } from "./db.js";
 import { searchMessageIds } from "./domain.js";
-import { fastEtag, sendPage, splicedGzipCache } from "./gzip.js";
+import { fastEtag, htmlType, sendPage, splicedGzipCache } from "./gzip.js";
 import { epoch as timeOf, renderChunks } from "./rendering.js";
 
 const OVERHEAD = 256;
@@ -214,11 +214,11 @@ export function pageKey(req, tag) {
   return JSON.stringify([
     tag,
     req.protocol,
-    req.get("host") ?? "",
+    req.headers.host ?? "",
     req.originalUrl,
     req.format ?? "",
-    req.get("turbo-frame") ?? "",
-    req.get("accept") ?? "",
+    req.headers["turbo-frame"] ?? "",
+    req.headers.accept ?? "",
     req.user?.id ?? 0,
     req.authenticatedByBot ? 1 : 0,
     req.session?.last_room_id ?? "",
@@ -330,7 +330,7 @@ const verifying = () => process.env.CAMPFIRE_CACHE_VERIFY === "1";
 // and the session middleware's writeHead hook run on every request.
 // A GET may carry a body (handlers read e.g. req.body.q as a fallback); the key has no body.
 const hasBody = (req) =>
-  req.files?.length > 0 ||
+  req.uploads?.length > 0 ||
   (req.body != null &&
     (typeof req.body === "object" && !Buffer.isBuffer(req.body)
       ? Object.keys(req.body).length > 0
@@ -344,7 +344,7 @@ function renderPage(req, produce) {
 export function sendCachedPage(req, res, tag, produce, cache = responseCache) {
   if (req.method !== "GET" || !cache.budget || hasBody(req)) {
     const html = produce();
-    return html === undefined ? undefined : res.type("html").send(html);
+    return html === undefined ? undefined : res.type(htmlType).send(html);
   }
   const epoch = req.pageEpoch ?? pageEpoch();
   const key = pageKey(req, tag);
@@ -375,12 +375,12 @@ export function sendCachedPage(req, res, tag, produce, cache = responseCache) {
   const bytes = Buffer.concat(chunks);
   const page = new Page(
     chunks,
-    res.get("ETag") || (req.app.enabled("etag") ? fastEtag(bytes) : undefined),
+    res.getHeader("ETag") || fastEtag(bytes),
     bytes,
   );
   if (
     res.statusCode === 200 &&
-    !res.get("Set-Cookie") &&
+    !res.getHeader("Set-Cookie") &&
     middlewareRowsCurrent(req)
   ) {
     const deps = req.pageDeps;

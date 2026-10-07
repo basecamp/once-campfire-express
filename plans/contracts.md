@@ -1,6 +1,6 @@
 # Compatibility and verification
 
-Native JavaScript/Express implementation; immutable public Rails reference `659f957`.
+Native JavaScript/Fastify implementation (Express 5 until the Fastify move); immutable public Rails reference `659f957`.
 Existing SQLite schema, original files, bcrypt credentials and Rails JSON cookies are
 the compatibility contract. Raw evidence stays ignored in `tmp/`.
 
@@ -9,7 +9,7 @@ the compatibility contract. Raw evidence stays ignored in `tmp/`.
 | Rails signing, encryption and CSRF | Independent Rails vectors verify PBKDF2 keys, signed/encrypted cookies, signed IDs including large integers, SGIDs, application verifiers, Turbo streams, session continuity, purpose/expiry/signature rejection and 189 CSRF cases. Bounded data-only Marshal fixtures come from Ruby. |
 | SQLite and messages | Real isolated databases test nested rollback, membership authorization, raw timestamp cursors, persisted writes, updates/deletion and FTS; independent HTTP checks compare actual stored records. |
 | Frontend | Independent browser checks cover live compose/edit/delete/boost, mentions, paging, search, private/direct rooms, image upload/lightbox, administration and fresh setup. |
-| Sessions | Independent original Rails server accepts Express-issued cookies and Express accepts Rails-issued cookies on shared disposable data. |
+| Sessions | Independent original Rails server accepts this port's cookies and the port accepts Rails-issued cookies on shared disposable data (run under Express; cookie encryption and signing are unchanged by Fastify). |
 | Action Cable | Real sockets verify native subscription delivery, forged stream rejection, membership revocation, logout revocation and multi-tab presence. Cross-worker production browser delivery is exercised. |
 | Storage and media | Actual 3840×2160 JPEG becomes 1200×675; real ffmpeg audio/video analysis and poppler PDF preview; Rails-issued signed transform accepted; direct upload checksum/range/owner/private-room checks and failed-media rollback. |
 | Benchmarks | Matched production images with identical ordered 40-room/40-page/13-search windows, zero timed request failures, every acknowledged write stored with rich text and FTS, and SQLite integrity checks. Two paced runs admit all 100 sockets and deliver all 30 messages to every connection. Raw output remains ignored. |
@@ -67,6 +67,16 @@ branch needs fresh production Docker checks and re-measured benchmarks.
   body digest memo keys on `updated_at`, length and a head/tail sample, so a same-millisecond
   edit with identical length, head and tail can serve stale cached HTML (Rails keys on
   `updated_at` alone).
+- HTTP runs on Fastify 5 (`@fastify/static`, `@fastify/multipart`, `@fastify/compress`,
+  `@fastify/cookie`, `@fastify/accepts`; `qs` for query strings and form bodies) instead of
+  Express 5. Routes, statuses, redirects, cookies, CSRF, uploads and caching are functionally
+  unchanged; bytes are not: redirects carry no body, header names are lowercase, string
+  bodies without a type default to `text/plain`, and ETags of non-page bodies are
+  `W/"<length>-<crc32>"` instead of Express's SHA-1. A form's `_method` is honoured by
+  `src/router.js`, which also keeps Express's ordered `next()` fall-through between
+  same-shaped routes (`/rooms/:kind` before `/rooms/:roomId`). `/up//` gets 403 from the
+  static fallback where Express answered 404. Verified by `npm test` and a seed smoke run
+  (single and cluster workers); not re-benchmarked.
 - CSRF: `Sec-Fetch-Site` replaces tokens. Writes accept `same-origin` and `same-site`,
   reject `cross-site`, `none` and missing headers over HTTPS with 422, and retain the
   `Origin` check. Plain HTTP accepts missing headers with `SameSite=Lax` cookies. Pages omit
@@ -75,7 +85,7 @@ branch needs fresh production Docker checks and re-measured benchmarks.
   sessions get none. Bot-key message routes stay exempt. `assets/overrides/models/file_uploader.js`
   drops the upload's `X-CSRF-Token` header, which read the removed meta tag.
   HTTPS is detected from `req.secure` (`X-Forwarded-Proto` only through `TRUSTED_PROXIES`);
-  Express has no `force_ssl` setting, so the Rust port's extra "app forces SSL" condition
+  the app has no `force_ssl` setting, so the Rust port's extra "app forces SSL" condition
   has no counterpart. The 189 Rails CSRF vectors still test `validCsrf`/`maskCsrf`, which
   requests no longer call.
 - Whole-page response cache per worker (`CAMPFIRE_RESPONSE_CACHE_MB`, default 32, 0
@@ -99,13 +109,13 @@ branch needs fresh production Docker checks and re-measured benchmarks.
   `.br`/`.gz` files built by `bin/build-assets.js`; the file set is read at startup.
 - Public responses are kept in memory per worker (`CAMPFIRE_PUBLIC_CACHE_MB`, default 32, 0
   disables; LRU): each digested asset variant (identity/br/gzip) with prebuilt headers is answered
-  before Express, and avatar bodies are keyed by their ETag, which covers user name,
+  before Fastify, and avatar bodies are keyed by their ETag, which covers user name,
   `updated_at` and avatar blob, so changes show on the next request. A file is read on its
   first request (served from disk meanwhile) and never re-read (files over half the budget
   are never read, and ones resized since startup never stored). Range, `If-Match`,
   `If-Unmodified-Since` and on-the-fly-compressed requests keep the file-serving chain. Status,
-  headers and bytes match it (diffed over every asset and encoding, and 2,010 captured
-  responses on the seed).
+  bytes and client-relevant headers match it (diffed over every asset and encoding by
+  `test/static_responses.test.js`; the 2,010-response seed capture predates Fastify).
 - `/up` answers before the session middleware, as Rails' health controller does: no
   `_campfire_session` cookie, ban check or `last_active_at` update. Matched paths, body and ETag
   are unchanged.

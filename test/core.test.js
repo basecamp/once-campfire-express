@@ -12,7 +12,7 @@ const { all, get, run, transaction, initialize, now } =
 const domain = await import("../src/domain.js");
 const { plainText, sanitize, mentionIds } = await import("../src/richtext.js");
 const rails = await import("../src/rails.js");
-const { createApp } = await import("../src/app.js");
+const { createServer: createAppServer } = await import("../src/app.js");
 const { fragment, render } = await import("../src/rendering.js");
 let admin, member, outsider, open, privateRoom;
 before(() => {
@@ -187,7 +187,7 @@ test("retained frontend compiles room/login/sidebar/profile/admin screens", () =
   assert.ok(fragment("messages", { Messages: [] }) === "");
 });
 test("HTTP actual cookie login, Sec-Fetch-Site, rooms, search, posting and private denial", async () => {
-  const server = createServer(createApp());
+  const server = await createAppServer();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   let cookie = "";
@@ -277,7 +277,7 @@ test("HTTP actual cookie login, Sec-Fetch-Site, rooms, search, posting and priva
 test("writes are verified by Sec-Fetch-Site and Origin instead of tokens", async () => {
   const trusted = process.env.TRUSTED_PROXIES;
   process.env.TRUSTED_PROXIES = "loopback";
-  const server = createServer(createApp());
+  const server = await createAppServer();
   if (trusted === undefined) delete process.env.TRUSTED_PROXIES;
   else process.env.TRUSTED_PROXIES = trusted;
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -396,7 +396,7 @@ test("search and sidebar issue a bounded number of queries", async () => {
       other.id,
     ]);
   }
-  const server = createServer(createApp());
+  const server = await createAppServer();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
@@ -493,7 +493,7 @@ test("failed image create and edit leave existing message body, attachments and 
     now(),
     now(),
   );
-  const server = createServer(createApp());
+  const server = await createAppServer();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`,
     auth =
@@ -605,7 +605,7 @@ test("room namespaces cannot promote direct history or bypass shared room admini
     time,
     time,
   );
-  const server = createServer(createApp());
+  const server = await createAppServer();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   const auth =
@@ -688,7 +688,7 @@ test("Attachment-only bot JSON and notification text use the original filename",
   );
   assert.equal(messagePlainText(message.id, ""), "contract-file.txt");
   assert.equal(messagePlainText(message.id, "<p>Caption</p>"), "Caption");
-  const req = { protocol: "http", get: () => "example.test" };
+  const req = { protocol: "http", headers: { host: "example.test" } };
   assert.equal(
     serializeMessage(message, req).body.plain_text,
     "contract-file.txt",
@@ -739,7 +739,7 @@ async function httpSession(user, token) {
     now(),
     now(),
   );
-  const server = createServer(createApp());
+  const server = await createAppServer();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const host = `127.0.0.1:${server.address().port}`,
     base = `http://${host}`,
@@ -909,7 +909,7 @@ test("messages page answers unchanged conditional requests with 304 before rende
   const http = await httpSession(admin, "etag-session");
   const url = `http://${http.host}/rooms/${open.id}/messages`;
   // Node's fetch adds Cache-Control: no-cache to conditional requests unless one is set,
-  // which makes Express treat them as never fresh; browsers revalidate with max-age=0.
+  // which makes `fresh` treat them as never fresh; browsers revalidate with max-age=0.
   const get = (headers = {}) =>
     fetch(url, {
       headers: {

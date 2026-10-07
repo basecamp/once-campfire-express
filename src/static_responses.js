@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import compressible from "compressible";
 import fresh from "fresh";
-import mime from "mime-types";
+import send from "@fastify/send";
 import { FragmentCache } from "./fragment_cache.js";
 
 const OVERHEAD = 512;
@@ -15,16 +15,26 @@ export const publicResponses = responseCache(
 );
 
 export const SECURITY_HEADERS = {
-  "X-Content-Type-Options": "nosniff",
-  "X-Frame-Options": "SAMEORIGIN",
-  "Referrer-Policy": "strict-origin-when-cross-origin",
+  "x-content-type-options": "nosniff",
+  "x-frame-options": "SAMEORIGIN",
+  "referrer-policy": "strict-origin-when-cross-origin",
 };
+// @fastify/compress's default compressibleTypes, then mime-db's compressible flag.
+const PLUGIN_COMPRESSIBLE =
+  /^text\/(?!event-stream)|(?:\+|\/)json(?:;|$)|(?:\+|\/)text(?:;|$)|(?:\+|\/)xml(?:;|$)|octet-stream(?:;|$)/u;
+const compressedByPlugin = (type) =>
+  PLUGIN_COMPRESSIBLE.test(type) || compressible(type) === true;
 const SUFFIXES = { br: ".br", gzip: ".gz" };
 const ENCODINGS = ["br", "gzip"];
 const NEGOTIATED_LIMIT = 256;
 
-const typeOf = (name) =>
-  mime.contentType(path.extname(name)) || "application/octet-stream";
+// The Content-Type @fastify/send gives the file (its mime table and utf-8 rule).
+function typeOf(name) {
+  const type = send.mime.getType(name) || "application/octet-stream";
+  return /^(?:text\/|application\/(?:javascript|json))/.test(type)
+    ? type + "; charset=utf-8"
+    : type;
+}
 
 function listFiles(root) {
   if (!fs.existsSync(root)) return new Map();
@@ -46,50 +56,36 @@ function listFiles(root) {
         br: sizes.get(name + ".br"),
         gzip: sizes.get(name + ".gz"),
       },
-      // compression() encodes these itself for any request with Accept-Encoding.
-      compressedOnTheFly: compressible(typeOf(name)) && size >= 1024,
+      // @fastify/compress encodes these itself, whatever their size (its threshold applies only
+      // to in-memory bodies), for any request with Accept-Encoding.
+      compressedOnTheFly: compressedByPlugin(typeOf(name)),
     });
   return files;
 }
 
-// Rebuilds the exact headers of the precompressedAssets + express.static + compression chain in
-// app.js: send's validators come from the served file's stat, compression adds Vary only while
-// a compressible Content-Type is present, and send's 304 drops every Content-* header.
+// Rebuilds the headers of the @fastify/static (preCompressed) + @fastify/compress chain in
+// app.js: send's validators come from the served file's stat, and a 304 drops every Content-* header.
 function buildEntry(name, encoding, stat, body) {
-  const type = typeOf(name);
   const validators = {
-    "Accept-Ranges": "bytes",
-    "Cache-Control": "public, max-age=31536000, immutable",
-    "Last-Modified": stat.mtime.toUTCString(),
-    ETag: `W/"${stat.size.toString(16)}-${stat.mtime.getTime().toString(16)}"`,
+    "accept-ranges": "bytes",
+    "cache-control": "public, max-age=31536000, immutable",
+    "last-modified": stat.mtime.toUTCString(),
+    etag: `W/"${stat.size.toString(16)}-${stat.mtime.getTime().toString(16)}"`,
   };
-  const vary = { Vary: "Accept-Encoding" };
-  const length = { "Content-Length": String(body.length) };
-  if (encoding === "identity")
-    return {
-      body,
-      validators,
-      ok: {
-        ...SECURITY_HEADERS,
-        ...validators,
-        "Content-Type": type,
-        ...length,
-        ...(compressible(type) ? vary : {}),
-      },
-      notModified: { ...SECURITY_HEADERS, ...validators },
-    };
+  // preCompressed static serving varies every asset on Accept-Encoding.
+  const vary = { vary: "accept-encoding" };
   return {
     body,
     validators,
     ok: {
       ...SECURITY_HEADERS,
-      "Content-Type": type,
-      "Content-Encoding": encoding,
-      ...vary,
       ...validators,
-      ...length,
+      "content-type": typeOf(name),
+      "content-length": String(body.length),
+      ...vary,
+      ...(encoding === "identity" ? {} : { "content-encoding": encoding }),
     },
-    notModified: { ...SECURITY_HEADERS, ...vary, ...validators },
+    notModified: { ...SECURITY_HEADERS, ...validators, ...vary },
   };
 }
 
@@ -116,8 +112,8 @@ export function cachedAssets(root, cache = publicResponses) {
       .catch(() => {})
       .finally(() => loading.delete(key));
   };
-  // Returns whether it answered. Without Express (negotiate null) only Accept-Encoding values
-  // already negotiated are answered; the Express pass negotiates and remembers the rest.
+  // Returns whether it answered. Without Fastify (negotiate null) only Accept-Encoding values
+  // already negotiated are answered; the Fastify pass negotiates and remembers the rest.
   const respond = (req, res, pathname, negotiate) => {
     if (req.method !== "GET" && req.method !== "HEAD") return false;
     const headers = req.headers;
@@ -147,8 +143,8 @@ export function cachedAssets(root, cache = publicResponses) {
     }
     if (
       fresh(headers, {
-        etag: entry.validators.ETag,
-        "last-modified": entry.validators["Last-Modified"],
+        etag: entry.validators.etag,
+        "last-modified": entry.validators["last-modified"],
       })
     ) {
       res.writeHead(304, entry.notModified);
@@ -159,19 +155,27 @@ export function cachedAssets(root, cache = publicResponses) {
     }
     return true;
   };
-  const middleware = (req, res, next) =>
-    respond(req, res, req.path, () => req.acceptsEncodings(ENCODINGS)) ||
-    next();
-  // For use before Express wraps req/res: names are exact file paths, so a raw pathname that
-  // differs from Express's parse (absolute-form, encoded) simply misses and goes the long way.
-  middleware.direct = (req, res) => {
-    const query = req.url.indexOf("?");
-    return respond(
-      req,
-      res,
-      query < 0 ? req.url : req.url.slice(0, query),
-      null,
-    );
+  return {
+    // Inside Fastify (an onRequest hook): negotiates and remembers new Accept-Encoding values.
+    hook: (req, reply) => {
+      const query = req.url.indexOf("?");
+      return respond(
+        req.raw,
+        reply.raw,
+        query < 0 ? req.url : req.url.slice(0, query),
+        () => req.encodings(ENCODINGS),
+      );
+    },
+    // Before Fastify wraps req/res: names are exact file paths, so a raw pathname that differs
+    // from Fastify's parse (absolute-form, encoded) simply misses and goes the long way.
+    direct: (req, res) => {
+      const query = req.url.indexOf("?");
+      return respond(
+        req,
+        res,
+        query < 0 ? req.url : req.url.slice(0, query),
+        null,
+      );
+    },
   };
-  return middleware;
 }

@@ -59,12 +59,12 @@ function attachment(type, id, name) {
   );
 }
 function cache(req, res, etag) {
-  res.set({
+  res.headers({
     ETag: etag,
     "Cache-Control": "public, max-age=1800, stale-while-revalidate=604800",
   });
   if (req.headers["if-none-match"] === etag) {
-    res.status(304).end();
+    res.status(304).send();
     return true;
   }
   return false;
@@ -104,14 +104,21 @@ async function buildAvatar(user, blob) {
   return { svg: true, body: svg };
 }
 function sendAvatar(req, res, avatar) {
-  if (avatar.svg) return res.type("image/svg+xml").send(avatar.body);
+  if (avatar.svg)
+    return res
+      .type(
+        typeof avatar.body === "string"
+          ? "image/svg+xml; charset=utf-8"
+          : "image/svg+xml",
+      )
+      .send(avatar.body);
   serveBytes(req, res, avatar.body, "image/webp", avatar.filename);
 }
 export const healthCheck = (req, res) =>
-  req.accepts(["html", "json"]) === "json"
-    ? res.json({ status: "ok" })
+  req.type(["html", "json"]) === "json"
+    ? res.send({ status: "ok" })
     : res
-        .type("html")
+        .type("text/html; charset=utf-8")
         .send(
           '<!doctype html><html><body style="background-color: green"></body></html>',
         );
@@ -160,7 +167,7 @@ export function registerPublic(app) {
       const filename =
         req.query.size === "small" ? "app-icon-192.png" : "app-icon.png";
       res
-        .type("png")
+        .type("image/png")
         .send(
           fs.readFileSync(
             path.join("reference/app/assets/images/logos", filename),
@@ -180,7 +187,7 @@ export function registerPublic(app) {
   });
   app.get(["/webmanifest", "/webmanifest.json"], (req, res) => {
     const account = get("SELECT name FROM accounts LIMIT 1");
-    res.type("application/manifest+json").json({
+    res.type("application/manifest+json; charset=utf-8").send({
       name: account?.name || "Campfire",
       icons: [
         {
@@ -211,7 +218,7 @@ export function registerPublic(app) {
   });
   app.get(["/service-worker", "/service-worker.js"], (req, res) =>
     res
-      .type("application/javascript")
+      .type("application/javascript; charset=utf-8")
       .send(fs.readFileSync("reference/app/views/pwa/service_worker.js")),
   );
   app.get("/qr_code/:id", async (req, res) => {
@@ -219,7 +226,7 @@ export function registerPublic(app) {
       const raw = rails.decode64(req.params.id);
       const value = new TextDecoder("utf-8", { fatal: true }).decode(raw);
       if (value.length > 4096) return res.sendStatus(422);
-      res.type("png").send(await QRCode.toBuffer(value));
+      res.type("image/png").send(await QRCode.toBuffer(value));
     } catch {
       res.sendStatus(404);
     }

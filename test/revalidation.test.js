@@ -13,7 +13,7 @@ const { openDatabase } = await import("../src/sqlite.js");
 const domain = await import("../src/domain.js");
 const rails = await import("../src/rails.js");
 const storage = await import("../src/storage.js");
-const { createApp } = await import("../src/app.js");
+const { createServer: createAppServer } = await import("../src/app.js");
 const { responseCache } = await import("../src/response_cache.js");
 
 // Timestamps a page shows must be SETTLE_MS old before the page is revalidated; the tests move a
@@ -109,7 +109,7 @@ before(async () => {
     );
   }
   advance();
-  server = createServer(createApp());
+  server = await createAppServer();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   base = `http://127.0.0.1:${server.address().port}`;
 });

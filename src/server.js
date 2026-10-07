@@ -1,8 +1,7 @@
 import cluster from "node:cluster";
-import http from "node:http";
 import { initialize, deferCheckpoints, databaseFile, db } from "./db.js";
 import { parseWebWorkers } from "./workers.js";
-import { createApp } from "./app.js";
+import { createServer } from "./app.js";
 import { attachCable, relayCable } from "./cable.js";
 import {
   startWorker,
@@ -43,7 +42,7 @@ if (cluster.isPrimary) {
   }
 }
 if (serves) {
-  server = http.createServer(createApp());
+  server = await createServer();
   attachCable(server);
   listen();
 }
@@ -51,7 +50,7 @@ if (serves) {
 function listen() {
   const port = Number(process.env.HTTP_PORT || 8080);
   const host = process.env.BIND || "0.0.0.0";
-  const announce = () => console.log(`Campfire Express listening on ${port}`);
+  const announce = () => console.log(`Campfire Fastify listening on ${port}`);
   const reusePort =
     cluster.isWorker &&
     process.platform === "linux" &&
