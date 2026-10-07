@@ -1067,3 +1067,42 @@ test("the sidebar endpoint renders a complete page and preserves the authenticat
   assert.match(body, /id="user_sidebar"/);
   assert.match(body, /<\/html>/);
 });
+
+test("search finds sparse memberships behind newer inaccessible matches", () => {
+  const visible = domain.createMessage(
+    open.id,
+    admin.id,
+    "<p>searchsparseonly</p>",
+  );
+  const stamp = now();
+  transaction(() => {
+    for (let i = 0; i < 1100; i++) {
+      const result = run(
+        "INSERT INTO messages(room_id,creator_id,client_message_id,created_at,updated_at) VALUES (?,?,?,?,?)",
+        privateRoom.id,
+        admin.id,
+        `sparse-${i}`,
+        stamp,
+        stamp,
+      );
+      run(
+        "INSERT INTO message_search_index(rowid,body) VALUES (?,?)",
+        Number(result.lastInsertRowid),
+        "searchsparseonly",
+      );
+    }
+  });
+  assert.deepEqual(
+    domain.searchMessages(outsider, "searchsparseonly").map((m) => m.id),
+    [visible.id],
+  );
+  run(
+    "DELETE FROM memberships WHERE user_id=? AND room_id=?",
+    outsider.id,
+    open.id,
+  );
+  assert.deepEqual(domain.searchMessages(outsider, "searchsparseonly"), []);
+  domain.grantMemberships(open, [outsider.id]);
+  assert.deepEqual(domain.searchMessages(outsider, "searchsparseonly AND"), []);
+  assert.equal(domain.searchMessages(admin, "searchsparseonly").length, 100);
+});

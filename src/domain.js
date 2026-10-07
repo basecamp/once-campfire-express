@@ -46,6 +46,38 @@ export function messagesByIds(ids) {
   );
   return ids.map((id) => rows.get(id)).filter(Boolean);
 }
+// Read newest FTS matches without sorting the entire history. Sparse memberships
+// fall back after a bounded probe; hydration rechecks the current membership.
+export function searchMessages(user, query) {
+  const terms = query
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => '"' + word.replaceAll('"', '""') + '"')
+    .join(" ");
+  if (!terms) return [];
+  const probe = all(
+    "SELECT m.id, ms.user_id IS NOT NULL AS reachable FROM message_search_index idx JOIN messages m ON m.id=idx.rowid LEFT JOIN memberships ms ON ms.room_id=m.room_id AND ms.user_id=? WHERE idx.body MATCH ? ORDER BY idx.rowid DESC LIMIT 1000",
+    user.id,
+    terms,
+  );
+  let ids = probe
+    .filter((row) => row.reachable)
+    .slice(0, 100)
+    .map((row) => row.id);
+  if (ids.length < 100 && probe.length === 1000)
+    ids = all(
+      "SELECT m.id FROM messages m JOIN message_search_index idx ON idx.rowid=m.id JOIN memberships ms ON ms.room_id=m.room_id WHERE ms.user_id=? AND idx.body MATCH ? ORDER BY m.id DESC LIMIT 100",
+      user.id,
+      terms,
+    ).map((row) => row.id);
+  return all(
+    presentation +
+      " JOIN memberships ms ON ms.room_id=m.room_id WHERE ms.user_id=? AND m.id IN (SELECT value FROM json_each(?)) ORDER BY m.id",
+    user.id,
+    JSON.stringify(ids),
+  );
+}
+
 export function directMembers(roomIds) {
   const members = new Map(roomIds.map((id) => [id, []]));
   if (roomIds.length)

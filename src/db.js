@@ -35,6 +35,9 @@ export function initialize(
     );
   }
   validateSchema(connection);
+  connection.exec(
+    "CREATE INDEX IF NOT EXISTS index_messages_on_room_id_and_updated_at ON messages(room_id,updated_at)",
+  );
   applyDurabilityPragmas(connection);
   return connection;
 }

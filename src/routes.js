@@ -6,7 +6,7 @@ import {
   roomsForUser,
   userById,
   messageById,
-  messagesByIds,
+  searchMessages,
   directMembers,
   messagesForRoom,
   grantMemberships,
@@ -727,21 +727,13 @@ function registerRoomForms(app) {
           ids = [...new Set([...ids, req.user.id])].filter(
             (id) => !!get("SELECT id FROM users WHERE id=? AND status=0", id),
           );
-          for (const candidate of roomsForUser(req.user.id).filter(
-            (r) => r.type === "Rooms::Direct",
-          )) {
-            const members = all(
-              "SELECT user_id FROM memberships WHERE room_id=?",
-              candidate.id,
-            ).map((r) => r.user_id);
-            if (
-              members.length === ids.length &&
-              members.every((id) => ids.includes(id))
-            ) {
-              room = candidate;
-              return;
-            }
-          }
+          room = get(
+            "SELECT r.* FROM rooms r JOIN memberships m ON m.room_id=r.id WHERE r.type='Rooms::Direct' GROUP BY r.id HAVING COUNT(*)=? AND SUM(m.user_id IN (SELECT value FROM json_each(?)))=? ORDER BY r.id LIMIT 1",
+            ids.length,
+            JSON.stringify(ids),
+            ids.length,
+          );
+          if (room) return;
         } else if (kind === "opens")
           ids = all("SELECT id FROM users WHERE status=0").map((u) => u.id);
         else ids = [...new Set([...ids, req.user.id])];
@@ -1300,20 +1292,7 @@ function registerSearch(app) {
     sendCachedPage(req, res, "search", () => search(req, query));
   });
   function search(req, query) {
-    let rows = [];
-    if (query) {
-      const ids = all(
-        "SELECT m.id FROM messages m JOIN message_search_index idx ON idx.rowid=m.id JOIN memberships ms ON ms.room_id=m.room_id WHERE ms.user_id=? AND idx.body MATCH ? ORDER BY m.created_at DESC LIMIT 100",
-        req.user.id,
-        query
-          .split(/\s+/)
-          .map((word) => '"' + word.replaceAll('"', '""') + '"')
-          .join(" "),
-      ).map((r) => r.id);
-      rows = messagesByIds(ids).sort((a, b) =>
-        a.created_at.localeCompare(b.created_at),
-      );
-    }
+    const rows = searchMessages(req.user, query);
     return render(req, "search", {
       Messages: cachedMessages(rows),
       Query: query,
