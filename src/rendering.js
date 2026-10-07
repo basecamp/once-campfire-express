@@ -139,7 +139,7 @@ export function roomData(room, user, directMembers) {
     Label: members.map((u) => u.name.split(" ")[0]).join(", "),
   };
 }
-export function messageData(messages, origin = "") {
+export function messageData(messages) {
   if (!messages.length) return [];
   const ids = messages.map((m) => m.id),
     placeholders = ids.map(() => "?").join(",");
@@ -206,7 +206,7 @@ export function messageData(messages, origin = "") {
       Attachment: blob ? { Filename: blob.filename } : null,
       DownloadURL: url ? url + "?disposition=attachment" : "",
       BlobURL: url,
-      Permalink: `${origin}/rooms/${m.room_id}/@${m.id}`,
+      Permalink: `/rooms/${m.room_id}/@${m.id}`,
     };
   });
 }
@@ -336,24 +336,17 @@ export function messageCacheKeys(rows, origin = "") {
   );
 }
 
-export function cachedMessages(
-  rows,
-  origin = "",
-  keys = messageCacheKeys(rows, origin),
-) {
+export function cachedMessages(rows, keys = messageCacheKeys(rows)) {
   if (!rows.length) return [];
   const missing = rows.filter((_, i) => !messageFragments.has(keys[i]));
   const built = new Map(
-    messageData(missing, origin).map((data) => [
-      data.ID,
-      fragment("message", data),
-    ]),
+    messageData(missing).map((data) => [data.ID, fragment("message", data)]),
   );
   return rows.map((m, i) => ({
     Fragment: new FragmentHtml(
       messageFragments.fetch(keys[i], () =>
         fragmentEntry(
-          built.get(m.id) ?? fragment("message", messageData([m], origin)[0]),
+          built.get(m.id) ?? fragment("message", messageData([m])[0]),
         ),
       ),
     ),

@@ -1,6 +1,6 @@
 import { WebSocketServer, WebSocket } from "ws";
 import cluster from "node:cluster";
-import { get, run, now, transaction } from "./db.js";
+import { get, run, now, transaction, writeEpoch } from "./db.js";
 import * as rails from "./rails.js";
 // Keep the socket module independent from the HTTP router to avoid import cycles.
 function identity(header = "") {
@@ -50,11 +50,12 @@ function addSubscription(client, identifier, sub) {
 const AUTH_TTL = Number(process.env.CABLE_AUTH_TTL_MS || 1000);
 let authCheckCount = 0;
 export const authChecks = () => authCheckCount;
-// Revocation reaches open sockets within AUTH_TTL instead of on the very next
-// broadcast; the 3-second ping bounds it the same way.
+// Reuse authorization only while this connection and all external writers are unchanged.
 function alive(client) {
   const at = Date.now();
-  if (client.aliveUntil > at) return true;
+  const version = `${get("PRAGMA data_version").data_version}:${writeEpoch()}`;
+  if (client.aliveUntil > at && client.authVersion === version) return true;
+  client.authVersion = version;
   authCheckCount++;
   const ok = Boolean(
     get(
@@ -167,13 +168,17 @@ function deliverOne(stream, message) {
       client.ws.close(1008);
       continue;
     }
-    if (!(sub.authorizedUntil > Date.now())) {
+    if (
+      !(sub.authorizedUntil > Date.now()) ||
+      sub.authVersion !== client.authVersion
+    ) {
       if (!authorize(client, identifier)) {
         removeSubscription(client, identifier);
         frame(client, { type: "reject_subscription", identifier });
         continue;
       }
       sub.authorizedUntil = Date.now() + AUTH_TTL;
+      sub.authVersion = client.authVersion;
     }
     sendRaw(client, broadcastFrame(frames, identifier, message));
   }

@@ -30,62 +30,28 @@ and [benchmark commands](bench/README.md) for the production comparison.
 
 ## Benchmarks
 
-Measured with 16 concurrent clients on an AMD Ryzen AI MAX+ 395,
-with four hardware threads allocated to each app.
+Measured with 16 concurrent clients on an AMD Ryzen AI MAX+ 395 with 32 GB RAM,
+with four hardware cores allocated to each app.
 
-| HTTP workload (requests/sec) | Rails | [Django](https://github.com/basecamp/once-campfire-django) | [Laravel](https://github.com/basecamp/once-campfire-laravel) | [Express](https://github.com/basecamp/once-campfire-express) | [Elixir](https://github.com/basecamp/once-campfire-elixir) | [Go](https://github.com/basecamp/once-campfire-go) | [Rust](https://github.com/basecamp/once-campfire-rust) |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Room page | 241 | 170 | 164 | 559 | 722 | 3,860 | 36,260 |
-| Messages page | 413 | 196 | 175 | 777 | 1,053 | 5,573 | 40,872 |
-| Sidebar | 552 | 615 | 715 | 4,125 | 1,275 | 19,753 | 34,672 |
-| Search | 435 | 315 | 305 | 1,294 | 1,156 | 7,053 | 33,299 |
-| Post a message | 273 | 154 | 137 | 256 | 801 | 4,767 | 6,896 |
+| HTTP workload (requests/sec) | Rails | [Django](https://github.com/basecamp/once-campfire-django) | [Laravel](https://github.com/basecamp/once-campfire-laravel) | [Express](https://github.com/basecamp/once-campfire-express) | [Elixir](https://github.com/basecamp/once-campfire-elixir) | [Go](https://github.com/basecamp/once-campfire-go) | [Rust](https://github.com/basecamp/once-campfire-rust) | [C](https://github.com/basecamp/once-campfire-c) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Room page | 230 | 62 | 760 | 2,622 | 942 | 31,673 | 35,484 | 141,834 |
+| Messages page | 402 | 70 | 924 | 3,245 | 1,267 | 30,746 | 40,674 | 151,564 |
+| Sidebar | 468 | 229 | 1,383 | 34,938 | 2,515 | 18,586 | 34,479 | 159,850 |
+| Search | 399 | 118 | 1,135 | 6,613 | 1,814 | 29,765 | 34,432 | 155,456 |
+| Post a message | 248 | 112 | 498 | 2,088 | 1,400 | 9,073 | 8,998 | 7,460 |
 
-At 100 WebSocket connections and five messages/second, median delivery to every
-connection was 24 ms for Rails and 14 ms for Express. Every message reached every
-connection in both runs.
-
-The tables here were measured while the HTTP layer was Express 5, before the move to Fastify.
-The first table also predates the caching work below. A later matched run on a 16-thread x86-64
-host (same harness, 16 clients, servers on 4 hardware threads) measured this branch (the first column is `main` before these changes, same host):
-
-| HTTP workload (requests/sec) | Node 24 + Express before caching | Node.js 24 + Fastify | Rust |
-|---|---:|---:|---:|
-| Room page | 395 | 21,632 | 19,121 |
-| Messages page | 546 | 32,399 | 21,336 |
-| Sidebar | 3,059 | 45,509 | 17,702 |
-| Search | 935 | 42,285 | 18,222 |
-| Post a message | 124 | 1,914 | 4,346 |
-
-Reads hit the whole-page response cache because the read benchmark performs no concurrent
-writes. After a commit, cached pages are revalidated rather than dropped, so writes to other
-rooms keep them; this and the in-memory asset cache are not covered by `npm run bench`.
-
-Optimizations compared with the Rust port (🟡 = partial; the extra index is omitted to keep
-the original schema):
-
-| Optimization | Rust | Node.js + Fastify |
-|---|:---:|:---:|
-| Message fragment cache (Rails `cache message`) | ✅ | ✅ |
-| Whole-page response cache | ❌ | ✅ |
-| Query-result cache for per-request auth reads | ❌ | ✅ |
-| Prepared-statement cache + Rails 8 SQLite pragmas | ✅ | ✅ |
-| 304 for the messages page (`fresh_when`) | ✅ | ✅ |
-| CSRF via `Sec-Fetch-Site` (byte-stable pages) | ✅ | ✅ |
-| Spliced gzip from cached deflate pieces | ✅ | ✅ |
-| Whole-body gzip cache | ✅ | ✅ |
-| Precompressed `.br`/`.gz` assets | 🟡 | ✅ |
-| Zero-copy assets embedded in the binary | ✅ | 🟡 |
-| In-memory cache for public responses (Thruster-style) | ✅ | ✅ |
-| WAL checkpoints off the request path | ✅ | ✅ |
-| Jobs off the request path | ✅ | ✅ |
-| Single writer + reader pool | ✅ | ❌ |
-| Extra `messages(room_id, created_at)` index | ✅ | ❌ |
-| Cable: one frame per broadcast, per-stream index | ✅ | ✅ |
-| Cable: `permessage-deflate` compressed once | ✅ | ❌ |
-| All cores used | ✅ threads | ✅ processes |
+[Shared verification](https://github.com/basecamp/once-campfire-verification) · [Detailed results](https://github.com/basecamp/once-campfire-verification/blob/main/docs/performance-review.md).
 
 ## Known differences
+
+- Sidebar connection refresh waits for the current Turbo frame to finish loading,
+  preventing an aborted response on startup or reconnect. Obsolete connections and removed frames do not reload.
+
+- Cached message copy-link buttons store paths and resolve them against the current page,
+  keeping copied links absolute without embedding a request host in shared markup.
+
+- Search selects the newest 100 matching messages by insertion ID, then displays them in ID order. Backdated messages can appear in a different order from the original Rails app.
 
 - TLS terminates at a configured proxy.
 - HTTP runs on Fastify 5 (`@fastify/static`, `@fastify/multipart`, `@fastify/compress`,
@@ -128,7 +94,7 @@ the original schema):
 - The messages page answers 304 from an ETag built from the fragment keys (Rails
   `fresh_when @messages`).
 - Action Cable authorization is memoized for `CABLE_AUTH_TTL_MS` (default 1000).
-  Revocation is immediate in the worker performing it, within the TTL in other workers.
+  Every publication checks the database generation; local and external revocations invalidate the authorization memo immediately.
 - Whole-page response cache per worker (`CAMPFIRE_RESPONSE_CACHE_MB`, default 32, 0
   disables) for GET HTML: room, permalink, messages page, sidebar, search, show-message.
   An entry is current for the DB epoch it was stored in. After any commit (any process) it is
@@ -158,11 +124,10 @@ the original schema):
   are unchanged.
 - Rails cookie decryption and signature checks are memoized in bounded LRUs; cookies with an
   expiry are re-checked on every hit.
-- Message notification, push and webhook jobs are enqueued in one batch after the response,
-  through the primary (single writer). A hard crash between response and enqueue loses
-  them; clean shutdown flushes. Jobs run in parallel up to `JOB_CONCURRENCY` (default 3),
-  so completion order is not queue order; free slots are leased in one jobs-DB commit.
-  The jobs DB uses `synchronous=NORMAL`.
+- Message notification, push and webhook jobs are persisted in one batch before the response,
+  so acknowledged posts already have durable queue entries. Jobs run in parallel up to
+  `JOB_CONCURRENCY` (default 3),
+  so completion order is not queue order. The jobs DB uses `synchronous=NORMAL`.
 - Main-DB writes (`BEGIN IMMEDIATE` and autocommit `run()`) poll the write lock every
   0.025-1.5 ms (jittered `Atomics.wait`) for up to 10 s instead of SQLite's busy handler,
   which sleeps 1, 2, 5, 10... ms while a post holds the lock for about 0.2 ms; mixing the two
@@ -174,7 +139,7 @@ the original schema):
   order); the client re-sorts appended messages by sort value.
 - WAL checkpoints run on a background thread (`src/checkpoint.js`) in the primary: PASSIVE
   every 250 ms, TRUNCATE above 64 MB, forced RESTART above `CAMPFIRE_WAL_MAX_MB` (256).
-  Cluster web workers disable WAL autocheckpoint; single-process mode keeps a 64 MB backstop.
+  Every writer keeps a 64 MB autocheckpoint backstop if the background worker stalls.
 - `WEB_WORKERS` defaults to `auto`; cluster workers listen with `reusePort` on Linux
   (`REUSE_PORT=0` disables). HTML ETags are `W/"<length>-<fast hash>"`.
 - Action Cable keeps a per-stream subscriber index. A revoked or dead socket is cut off on

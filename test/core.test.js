@@ -891,12 +891,11 @@ test("room HTML reflects edits, boosts, renames and attachments even when timest
     assert.ok(!html.includes("first-fragment.txt"));
 
     html = await http.page(path, { host: "evil.test" });
-    const permalink = (host) =>
-      `data-copy-to-clipboard-content-value="http://${host}/rooms/${open.id}/@${message.id}"`;
-    assert.ok(html.includes(permalink("evil.test")), "e: host permalink");
+    const permalink = `data-copy-to-clipboard-url-value="/rooms/${open.id}/@${message.id}"`;
+    assert.ok(html.includes(permalink), "e: host-independent permalink");
     html = await room();
     assert.ok(!html.includes("evil.test"), "e: host must not leak");
-    assert.ok(html.includes(permalink(http.host)));
+    assert.ok(html.includes(permalink));
   } finally {
     await http.close();
     if (frozen === undefined) delete process.env.CAMPFIRE_FROZEN_TIME;
@@ -1033,5 +1032,158 @@ test("a posted message answers with the same fragment it broadcasts and indexes 
     );
   } finally {
     await http.close();
+  }
+});
+
+test("the sidebar endpoint renders a complete page and preserves the authenticated viewer", () => {
+  const body = render(
+    {
+      user: admin,
+      protocol: "http",
+      get: (name) => (name === "host" ? "example.test" : undefined),
+    },
+    "sidebar",
+  );
+  assert.match(body, /<!DOCTYPE html>/);
+  assert.match(
+    body,
+    new RegExp(`name="current-user-id" content="${admin.id}"`),
+  );
+  assert.match(body, /id="user_sidebar"/);
+  assert.match(body, /<\/html>/);
+});
+
+test("refresh uses the updated index and preserves the newest 80 messages and millisecond cursor", async () => {
+  const room = get(
+    "SELECT * FROM rooms WHERE id=?",
+    Number(
+      run(
+        "INSERT INTO rooms(name,type,creator_id,created_at,updated_at) VALUES('Refresh','Rooms::Open',?,?,?)",
+        admin.id,
+        now(),
+        now(),
+      ).lastInsertRowid,
+    ),
+  );
+  domain.grantMemberships(room, [admin.id]);
+  const since = Date.parse("2026-01-02T03:04:05.678Z");
+  const messages = [];
+  transaction(() => {
+    for (let i = 0; i < 110; i++) {
+      const message = domain.createMessage(
+        room.id,
+        admin.id,
+        `<p>Refresh ${i}</p>`,
+      );
+      run(
+        "UPDATE messages SET created_at=?,updated_at=? WHERE id=?",
+        `2025-01-01 00:00:${String(i % 60).padStart(2, "0")}.000000`,
+        i < 5 ? "2026-01-02 03:04:05.678999" : "2026-01-02 03:04:05.679000",
+        message.id,
+      );
+      messages.push(message);
+    }
+  });
+  const expected = all(
+    "SELECT * FROM messages WHERE room_id=? ORDER BY created_at,id",
+    room.id,
+  )
+    .filter((m) => Date.parse(m.updated_at.replace(" ", "T") + "Z") > since)
+    .slice(-80)
+    .map((m) => m.id);
+  assert.deepEqual(
+    domain.refreshMessages(room.id, since).map((m) => m.id),
+    expected,
+  );
+  assert.deepEqual(
+    domain.refreshMessages(room.id, since + 0.5).map((m) => m.id),
+    expected,
+  );
+  assert.equal(domain.refreshMessages(room.id, since + 1).length, 0);
+  const plan = all(
+    "EXPLAIN QUERY PLAN SELECT * FROM messages WHERE room_id=? AND updated_at>=? ORDER BY +created_at DESC,id DESC LIMIT 80",
+    room.id,
+    "2026-01-02 03:04:05.679",
+  );
+  assert.ok(
+    plan.some((step) =>
+      step.detail.includes("index_messages_on_room_id_and_updated_at"),
+    ),
+  );
+  const http = await httpSession(admin, "refresh-index-session");
+  try {
+    const body = await http.page(`/rooms/${room.id}/refresh?since=${since}`);
+    assert.deepEqual(
+      [...body.matchAll(/data-message-id="(\d+)"/g)].map((m) => Number(m[1])),
+      expected,
+    );
+    assert.equal((body.match(/action="replace"/g) || []).length, 80);
+  } finally {
+    await http.close();
+    domain.deleteRoom(room);
+  }
+});
+test("search finds sparse memberships behind newer inaccessible matches", () => {
+  const visible = domain.createMessage(
+    open.id,
+    admin.id,
+    "<p>searchsparseonly</p>",
+  );
+  const stamp = now();
+  transaction(() => {
+    for (let i = 0; i < 1100; i++) {
+      const result = run(
+        "INSERT INTO messages(room_id,creator_id,client_message_id,created_at,updated_at) VALUES (?,?,?,?,?)",
+        privateRoom.id,
+        admin.id,
+        `sparse-${i}`,
+        stamp,
+        stamp,
+      );
+      run(
+        "INSERT INTO message_search_index(rowid,body) VALUES (?,?)",
+        Number(result.lastInsertRowid),
+        "searchsparseonly",
+      );
+    }
+  });
+  assert.deepEqual(
+    domain.searchMessages(outsider, "searchsparseonly").map((m) => m.id),
+    [visible.id],
+  );
+  run(
+    "DELETE FROM memberships WHERE user_id=? AND room_id=?",
+    outsider.id,
+    open.id,
+  );
+  assert.deepEqual(domain.searchMessages(outsider, "searchsparseonly"), []);
+  domain.grantMemberships(open, [outsider.id]);
+  assert.deepEqual(domain.searchMessages(outsider, "searchsparseonly AND"), []);
+  assert.equal(domain.searchMessages(admin, "searchsparseonly").length, 100);
+});
+
+test("transfer landing page loads the automatic submit controller without creating a session on GET", async () => {
+  const server = createServer(createApp());
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const before = get("SELECT COUNT(*) n FROM sessions").n;
+  try {
+    const token = rails.signedId(
+      "User",
+      member.id,
+      "transfer",
+      new Date(Date.now() + 60000).toISOString(),
+    );
+    const response = await fetch(
+      `http://127.0.0.1:${server.address().port}/session/transfers/${token}`,
+    );
+    const html = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(html, /data-controller="auto-submit"/);
+    assert.match(html, /<script type="importmap"/);
+    assert.match(html, /name="_method" value="put"/);
+    assert.match(html, /<\/form>/);
+    assert.equal(get("SELECT COUNT(*) n FROM sessions").n, before);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
   }
 });

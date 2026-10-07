@@ -131,8 +131,8 @@ test("notifyMessage writes every job for a message in one batch", () => {
   addWebhook(bot, "http://127.0.0.1:9/b");
   const message = domain.createMessage(room, author, "Hello");
   domain.notifyMessage(message);
-  assert.equal(rows().length, 0);
-  assert.equal(jobs.flushJobs(), 4);
+  assert.equal(rows().length, 4);
+  assert.equal(jobs.flushJobs(), 0);
   const written = rows();
   assert.deepEqual(written.map((r) => JSON.parse(r.payload).kind).sort(), [
     "push",

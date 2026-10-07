@@ -6,11 +6,12 @@ import {
   roomsForUser,
   userById,
   messageById,
-  messagesByIds,
   directMembers,
   messagesForRoom,
   PAGE_SIZE,
   searchMessageIds,
+  messagesByIds,
+  refreshMessages,
   grantMemberships,
   createUser,
   createMessage,
@@ -47,7 +48,7 @@ import {
   processAttachment,
   purgeBlob,
 } from "./storage.js";
-import { enqueue, afterResponse } from "./jobs.js";
+import { enqueue } from "./jobs.js";
 import { htmlType, isFresh } from "./gzip.js";
 const token = () => randomBytes(18).toString("base64url");
 // Mirrors messagesForRoom(): a new message can change the window only if it sorts at or before
@@ -342,11 +343,7 @@ export function registerRoutes(app) {
   });
   app.all("/session/transfers/:id", (req, res) => {
     if (req.method === "GET")
-      return res
-        .type(htmlType)
-        .send(
-          `<form method="post"><input name="_method" value="put" type="hidden"><button>Sign in to Campfire</button></form>`,
-        );
+      return send(req, res, "transfer", { Transfer: req.params.id });
     if (!["PUT", "PATCH"].includes(req.method)) return res.sendStatus(405);
     let id;
     try {
@@ -495,7 +492,7 @@ export function registerRoutes(app) {
                 res.header("ETag", messagesEtag(keys));
                 if (isFresh(req, res)) return void res.status(304).send();
                 return fragment("messages", {
-                  Messages: cachedMessages(rows, "", keys),
+                  Messages: cachedMessages(rows, keys),
                 });
               });
         const rows = message ? [message] : messagesForRoom(room.id, req.query);
@@ -557,7 +554,7 @@ export function registerRoutes(app) {
           throw error;
         }
         const html = publishMessage(message);
-        afterResponse(res.raw, () => notifyMessage(message));
+        notifyMessage(message);
         if (isBot)
           return res
             .status(201)
@@ -609,21 +606,17 @@ export function registerRoutes(app) {
   app.get("/rooms/:roomId/refresh", login, (req, res) => {
     const room = required(roomForUser(req.user, req.params.roomId));
     const since = Number(req.query.since) || 0;
-    const messages = all(
-      "SELECT * FROM messages WHERE room_id=? ORDER BY created_at",
-      room.id,
-    )
-      .filter((m) => epoch(m.updated_at) > since)
-      .slice(-80);
+    const messages = refreshMessages(room.id, since);
+    const rendered = messageData(messagesByIds(messages.map((m) => m.id)));
     res.type("text/vnd.turbo-stream.html; charset=utf-8").send(
       messages
-        .map((m) => {
+        .map((m, i) => {
           const action = epoch(m.created_at) > since ? "append" : "replace",
             target =
               action === "append"
                 ? `messages_rooms_${room.type.split("::").pop().toLowerCase()}_${room.id}`
                 : "message_" + m.client_message_id;
-          return `<turbo-stream action="${action}" target="${target}"><template>${fragment("message", messageData([messageById(m.id)])[0])}</template></turbo-stream>`;
+          return `<turbo-stream action="${action}" target="${target}"><template>${fragment("message", rendered[i])}</template></turbo-stream>`;
         })
         .join(""),
     );
@@ -755,21 +748,13 @@ function registerRoomForms(app) {
           ids = [...new Set([...ids, req.user.id])].filter(
             (id) => !!get("SELECT id FROM users WHERE id=? AND status=0", id),
           );
-          for (const candidate of roomsForUser(req.user.id).filter(
-            (r) => r.type === "Rooms::Direct",
-          )) {
-            const members = all(
-              "SELECT user_id FROM memberships WHERE room_id=?",
-              candidate.id,
-            ).map((r) => r.user_id);
-            if (
-              members.length === ids.length &&
-              members.every((id) => ids.includes(id))
-            ) {
-              room = candidate;
-              return;
-            }
-          }
+          room = get(
+            "SELECT r.* FROM rooms r JOIN memberships m ON m.room_id=r.id WHERE r.type='Rooms::Direct' GROUP BY r.id HAVING COUNT(*)=? AND SUM(m.user_id IN (SELECT value FROM json_each(?)))=? ORDER BY r.id LIMIT 1",
+            ids.length,
+            JSON.stringify(ids),
+            ids.length,
+          );
+          if (room) return;
         } else if (kind === "opens")
           ids = all("SELECT id FROM users WHERE status=0").map((u) => u.id);
         else ids = [...new Set([...ids, req.user.id])];

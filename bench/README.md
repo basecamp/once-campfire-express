@@ -1,42 +1,36 @@
 # Benchmarks
 
-Ruby orchestrates fresh production containers of this Fastify app on Node 24 (app id `express`) and the
-[Rust port](https://github.com/basecamp/once-campfire-rust), alternating their order.
-Both the seed and the load generator come from a sibling `once-campfire-rust` checkout,
-and this repository is expected at the sibling path `once-campfire-express`:
+[once-campfire-verification](https://github.com/basecamp/once-campfire-verification)
+owns the shared response contracts, load generator, exact write audits and browser flows.
+Clone it alongside this repo and follow its setup instructions to build the client and
+canonical seed. This repo should have the sibling name `once-campfire-express`.
+
+With this repository's `reference` submodule checked out:
 
 ```sh
-cd ../once-campfire-rust
-git submodule update --init reference
-parity/bin/reference build && parity/bin/seed build default
-docker build -t campfire-rust:app .
-(cd bench/loadgen && cargo build --release)
+npm run bench:image       # rebuild the Node production image after changes
+npm run bench            # HTTP reads, then HTTP writes
 ```
 
-Then, from this repository with the `reference` submodule checked out:
+The default apps are `express,rust`; build the Rust production image separately
+or pass `--apps` to select a subset. `--help` lists all options. `VERIFICATION_ROOT`,
+`LOADGEN`, `BENCH_ENV_FILE`, `RUST_IMAGE` and `EXPRESS_IMAGE`
+can override paths or image names. `<APP>_BENCH_ENV` adds JSON environment overrides.
+Each npm suite writes to ignored `tmp/bench/results/{reads,writes}/` here; the direct
+`ruby bench/compare.rb` command uses ignored `tmp/bench/` in the verification checkout.
 
-```sh
-npm run bench:image       # rebuild once-campfire-express:app (Node) after every change
-npm run bench             # bench:reads, bench:writes and bench:cable in turn
-```
-
-Each suite writes `summary.json` and per-round JSON to `tmp/bench/results/{reads,writes,cable}/`.
-`--apps` picks a subset (default `express,rust`). `LOADGEN`, `BENCH_ENV_FILE`,
-`RUST_IMAGE` and `EXPRESS_IMAGE` override the defaults
-(`bench/loadgen/target/release/loadgen`, `parity/.env.reference`, `campfire-rust:app`,
-`once-campfire-express:app`); `<APP>_BENCH_ENV` (JSON) adds
-environment, e.g. `EXPRESS_BENCH_ENV='{"WEB_WORKERS":"3"}'`. Each run's metadata records
-the runtime per app. For other options, run `ruby bench/compare.rb --help`.
-
-Server processes share four hardware threads (`--cpus`); clients use separate threads
-(`--client-cpus`). The runner verifies exact ordered HTTP result windows, successful
-persisted writes, FTS entries, SQLite integrity and complete WebSocket delivery. It
-replaces fixture push and webhook destinations with loopback test endpoints. Raw output
-stays in ignored `tmp/bench/`; no benchmark results are tracked.
+Server processes share four assigned hardware threads; clients use separate threads.
+Every warmup and timed HTTP response must pass its content contract, and every
+acknowledged POST must match its exact stored message and search-index entry.
+The maintained comparison measures HTTP. Live Action Cable correctness is checked
+by the shared browser gate against a fresh disposable instance; HTTP throughput
+is not a WebSocket capacity result.
 
 ## Render parity snapshots
 
 `npm run snapshot` fetches hot routes from a running server as a logged-in user and stores
 the bodies; `npm run snapshot:compare` compares two stored snapshots byte for byte
 (`bench/snapshot.js`; flags in its header). CSRF meta tags and hidden token fields (which
-older commits rendered) are removed and the server origin is normalized first. Use it to confirm template and cache changes keep output identical.
+older commits rendered) are removed and the server origin is normalized first. Use it to
+confirm template and cache changes keep output identical. The default labels path still
+uses the local Rust parity seed; pass `--labels` to use the shared canonical seed.

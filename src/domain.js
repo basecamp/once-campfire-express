@@ -10,7 +10,7 @@ import {
 import { publish, publishMany, forgetUser } from "./cable.js";
 import { stream } from "./rails.js";
 import { cachedMessages } from "./rendering.js";
-import { enqueue, submitJobs } from "./jobs.js";
+import { enqueue, enqueueMany } from "./jobs.js";
 export const userById = (id) =>
   get("SELECT * FROM users WHERE id=?", Number(id));
 export const roomsForUser = (id) =>
@@ -47,6 +47,34 @@ export function messagesByIds(ids) {
   );
   return ids.map((id) => rows.get(id)).filter(Boolean);
 }
+export function refreshMessages(roomId, since) {
+  // The browser cursor is milliseconds, while SQLite stores microseconds. Match
+  // epoch(updated_at) > since without truncating the indexed column in SQL.
+  if (since >= 8640000000000000) return [];
+  const cutoff =
+    since <= -8640000000000000
+      ? ""
+      : new Date(Math.floor(since) + 1)
+          .toISOString()
+          .replace("T", " ")
+          .replace("Z", "");
+  return all(
+    "SELECT * FROM messages WHERE room_id=? AND updated_at>=? ORDER BY +created_at DESC,id DESC LIMIT 80",
+    roomId,
+    cutoff,
+  ).reverse();
+}
+// Read newest FTS matches without sorting the entire history. Sparse memberships
+// fall back after a bounded probe; hydration rechecks the current membership.
+export function searchMessages(user, query) {
+  return all(
+    presentation +
+      " JOIN memberships ms ON ms.room_id=m.room_id WHERE ms.user_id=? AND m.id IN (SELECT value FROM json_each(?)) ORDER BY m.id",
+    user.id,
+    JSON.stringify(searchMessageIds(user.id, query)),
+  );
+}
+
 export function directMembers(roomIds) {
   const members = new Map(roomIds.map((id) => [id, []]));
   if (roomIds.length)
@@ -101,16 +129,30 @@ export function messagesForRoom(id, { before, after, around } = {}) {
   const rows = all(pagedPresentation(clauses, after ? "ASC" : "DESC"), ...args);
   return after ? rows : rows.reverse();
 }
+// Read newest FTS matches without sorting the entire history. Sparse memberships
+// fall back after a bounded probe; hydration rechecks the current membership.
 export function searchMessageIds(userId, query) {
-  if (!query) return [];
-  return all(
-    "SELECT m.id FROM messages m JOIN message_search_index idx ON idx.rowid=m.id JOIN memberships ms ON ms.room_id=m.room_id WHERE ms.user_id=? AND idx.body MATCH ? ORDER BY m.created_at DESC LIMIT 100",
+  const terms = (query || "")
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => '"' + word.replaceAll('"', '""') + '"')
+    .join(" ");
+  if (!terms) return [];
+  const probe = all(
+    "SELECT m.id, ms.user_id IS NOT NULL AS reachable FROM message_search_index idx JOIN messages m ON m.id=idx.rowid LEFT JOIN memberships ms ON ms.room_id=m.room_id AND ms.user_id=? WHERE idx.body MATCH ? ORDER BY idx.rowid DESC LIMIT 1000",
     Number(userId),
-    query
-      .split(/\s+/)
-      .map((word) => '"' + word.replaceAll('"', '""') + '"')
-      .join(" "),
-  ).map((r) => r.id);
+    terms,
+  );
+  const ids = probe
+    .filter((row) => row.reachable)
+    .slice(0, 100)
+    .map((row) => row.id);
+  if (ids.length === 100 || probe.length < 1000) return ids;
+  return all(
+    "SELECT m.id FROM messages m JOIN message_search_index idx ON idx.rowid=m.id JOIN memberships ms ON ms.room_id=m.room_id WHERE ms.user_id=? AND idx.body MATCH ? ORDER BY m.id DESC LIMIT 100",
+    Number(userId),
+    terms,
+  ).map((row) => row.id);
 }
 export function grantMemberships(room, userIds) {
   const timestamp = now();
@@ -309,7 +351,7 @@ export function publishMessage(message, action = "append") {
   const events = [
     {
       stream: stream(room),
-      message: `<turbo-stream action="${action}" target="${target}" maintain_scroll="true"><template>${html}</template></turbo-stream>`,
+      message: `<turbo-stream action="${action}" target="${target}"><template>${html}</template></turbo-stream>`,
     },
   ];
   if (action === "append")
@@ -360,7 +402,7 @@ export function notifyMessage(message, { webhooks = true } = {}) {
         data: { user_id: m.user_id, message_id: message.id },
       });
   }
-  submitJobs(jobs);
+  if (jobs.length) enqueueMany(jobs);
 }
 export function deleteRoom(room) {
   for (const message of all("SELECT * FROM messages WHERE room_id=?", room.id))

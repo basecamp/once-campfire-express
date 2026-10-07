@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { once } from "node:events";
 import http from "node:http";
 import WebSocket from "ws";
+import { openDatabase } from "../src/sqlite.js";
 import { initialize, run, get, now } from "../src/db.js";
 import {
   attachCable,
@@ -115,7 +116,6 @@ test("Action Cable rejects forged signed streams and revoked membership", async 
   ws.send(JSON.stringify({ command: "subscribe", identifier }));
   await wait(() => frames.some((f) => f.type === "confirm_subscription"));
   run("DELETE FROM memberships WHERE room_id=1 AND user_id=1");
-  await pastTtl();
   publish(stream(room), "private-after-revoke");
   await wait(() =>
     frames.some(
@@ -239,6 +239,8 @@ test("publishMessage delivers the room event then one unread event per member", 
   const delivered = frames.filter((f) => f.message);
   assert.match(html, /batched hello/);
   assert.ok(delivered[0].message.includes(`<template>${html}</template>`));
+  // Appends use the messages controller's own scrolling; nesting maintain-scroll prevents insertion.
+  assert.doesNotMatch(delivered[0].message, /maintain_scroll/);
   assert.deepEqual(delivered[1].message, { roomId: 1 });
   ws.close();
   await once(ws, "close");
@@ -456,4 +458,27 @@ test("the primary relays a worker's broadcast to every other worker", () => {
     sent.map(([id]) => id),
     [1, 2, 3],
   );
+
+test("external membership revocation is checked on the next broadcast", async () => {
+  const c = await subscribed(id());
+  publish(stream(room), "warm-auth");
+  await wait(() => c.frames.some((f) => f.message === "warm-auth"));
+  const foreign = openDatabase(process.env.DATABASE_PATH);
+  try {
+    foreign
+      .prepare("DELETE FROM memberships WHERE room_id=1 AND user_id=1")
+      .run();
+    publish(stream(room), "external-private");
+    await wait(() => c.frames.some((f) => f.type === "reject_subscription"));
+    assert(!c.frames.some((f) => f.message === "external-private"));
+  } finally {
+    foreign.close();
+    const t = now();
+    run(
+      "INSERT OR IGNORE INTO memberships(room_id,user_id,created_at,updated_at) VALUES(1,1,?,?)",
+      t,
+      t,
+    );
+    await closeAll([c]);
+  }
 });

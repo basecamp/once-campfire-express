@@ -38,6 +38,9 @@ export function initialize(
     );
   }
   validateSchema(connection);
+  connection.exec(
+    "CREATE INDEX IF NOT EXISTS index_messages_on_room_id_and_updated_at ON messages(room_id,updated_at)",
+  );
   applyDurabilityPragmas(connection);
   return connection;
 }
@@ -137,7 +140,11 @@ function cached(sql, params, read, copy) {
   }
   misses++;
   const value = read(sql, ...params);
-  const limit = Number(process.env.CAMPFIRE_QUERY_CACHE_ENTRIES) || 1000;
+  const configured = Number(process.env.CAMPFIRE_QUERY_CACHE_ENTRIES);
+  const limit =
+    Number.isSafeInteger(configured) && configured > 0
+      ? Math.min(configured, 10000)
+      : 1000;
   while (queryCache.size >= limit)
     queryCache.delete(queryCache.keys().next().value);
   queryCache.set(key, value);

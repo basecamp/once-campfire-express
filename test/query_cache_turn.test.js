@@ -30,3 +30,16 @@ test("data_version is validated once per turn and re-armed after it", async () =
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("invalid query cache limits cannot prevent a cache miss from returning", () => {
+  const previous = process.env.CAMPFIRE_QUERY_CACHE_ENTRIES;
+  try {
+    for (const limit of ["-1", "0", "NaN", "Infinity", "0.5"]) {
+      process.env.CAMPFIRE_QUERY_CACHE_ENTRIES = limit;
+      assert.equal(getCached("SELECT ? AS n", limit).n, limit);
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CAMPFIRE_QUERY_CACHE_ENTRIES;
+    else process.env.CAMPFIRE_QUERY_CACHE_ENTRIES = previous;
+  }
+});
