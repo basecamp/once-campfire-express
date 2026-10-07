@@ -31,61 +31,16 @@ and [benchmark commands](bench/README.md) for the production comparison.
 
 ## Benchmarks
 
-Measured with 16 concurrent clients on an AMD Ryzen AI MAX+ 395,
+Measured with 16 concurrent clients on an AMD Ryzen AI MAX+ 395 with 32 GB RAM,
 with four hardware threads allocated to each app.
 
 | HTTP workload (requests/sec) | Rails | [Django](https://github.com/basecamp/once-campfire-django) | [Laravel](https://github.com/basecamp/once-campfire-laravel) | [Express](https://github.com/basecamp/once-campfire-express) | [Elixir](https://github.com/basecamp/once-campfire-elixir) | [Go](https://github.com/basecamp/once-campfire-go) | [Rust](https://github.com/basecamp/once-campfire-rust) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Room page | 241 | 170 | 164 | 559 | 722 | 3,860 | 36,260 |
-| Messages page | 413 | 196 | 175 | 777 | 1,053 | 5,573 | 40,872 |
-| Sidebar | 552 | 615 | 715 | 4,125 | 1,275 | 19,753 | 34,672 |
-| Search | 435 | 315 | 305 | 1,294 | 1,156 | 7,053 | 33,299 |
-| Post a message | 273 | 154 | 137 | 256 | 801 | 4,767 | 6,896 |
-
-At 100 WebSocket connections and five messages/second, median delivery to every
-connection was 24 ms for Rails and 14 ms for Express. Every message reached every
-connection in both runs.
-
-The table above predates the caching work below. A later matched run on a 16-thread x86-64
-host (same harness, 16 clients, servers on 4 hardware threads, Rust-style caching; the first
-column is `main` before these changes on the same host):
-
-| HTTP workload (requests/sec) | Node 24 before caching | Express on Node 24 | Express on Bun 1.4.2 | Rust |
-|---|---:|---:|---:|---:|
-| Room page | 395 | 2,012 | 4,759 | 19,493 |
-| Messages page | 546 | 2,556 | 5,992 | 21,698 |
-| Sidebar | 3,059 | 20,358 | 23,022 | 18,623 |
-| Search | 935 | 4,526 | 11,014 | 18,933 |
-| Post a message | 124 | 1,374 | 1,668 | 4,276 |
-
-Median Cable delivery to 100 sockets: 5–7 ms on Node and Bun, 1.5 ms on Rust. With the opt-in
-whole-page cache (`CAMPFIRE_RESPONSE_CACHE_MB=32`) and no concurrent writes, reads reached
-20–36k req/s on Node and 24–42k on Bun; any committed write clears that cache.
-
-Optimizations compared with the Rust port (🟡 = partial; the extra index is omitted to keep
-the original schema):
-
-| Optimization | Rust | Express (Node/Bun) |
-|---|:---:|:---:|
-| Message fragment cache (Rails `cache message`) | ✅ | ✅ |
-| Whole-page response cache | ❌ | opt-in |
-| Query-result cache for per-request auth reads | ❌ | ✅ |
-| Prepared-statement cache + Rails 8 SQLite pragmas | ✅ | ✅ |
-| 304 for the messages page (`fresh_when`) | ✅ | ✅ |
-| CSRF via `Sec-Fetch-Site` (byte-stable pages) | ✅ | ✅ |
-| Spliced gzip from cached deflate pieces | ✅ | ✅ |
-| Whole-body gzip cache | ✅ | ✅ |
-| Precompressed `.br`/`.gz` assets | 🟡 | ✅ |
-| Zero-copy assets embedded in the binary | ✅ | ❌ |
-| In-memory cache for public responses (Thruster-style) | ✅ | ✅ |
-| Sidebar direct-row fragment cache | ✅ | ✅ |
-| WAL checkpoints off the request path | ✅ | ✅ |
-| Jobs off the request path | ✅ | ✅ |
-| Single writer + reader pool | ✅ | ❌ |
-| Extra `messages(room_id, created_at)` index | ✅ | ❌ |
-| Cable: one frame per broadcast, per-stream index | ✅ | ✅ |
-| Cable: `permessage-deflate` compressed once | ✅ | ❌ |
-| All cores used | ✅ threads | ✅ processes |
+| Room page | 236 | 62 | 764 | 2,702 | 981 | 32,045 | 35,056 |
+| Messages page | 384 | 70 | 922 | 3,183 | 1,341 | 31,670 | 40,481 |
+| Sidebar | 474 | 230 | 1,399 | 34,595 | 2,546 | 20,125 | 33,924 |
+| Search | 415 | 120 | 1,291 | 6,725 | 1,907 | 30,239 | 34,199 |
+| Post a message | 244 | 113 | 498 | 2,183 | 1,431 | 9,413 | 8,995 |
 
 ## Known differences
 
