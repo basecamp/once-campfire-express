@@ -467,7 +467,11 @@ test("message cache keys follow updated_at, which every edit moves even in one f
       "<p>dddd</p>",
       message.id,
     );
-    assert.notEqual(key(), third, "observed writes also namespace unchanged timestamps");
+    assert.notEqual(
+      key(),
+      third,
+      "observed writes also namespace unchanged timestamps",
+    );
   } finally {
     if (frozen === undefined) delete process.env.CAMPFIRE_FROZEN_TIME;
     else process.env.CAMPFIRE_FROZEN_TIME = frozen;
