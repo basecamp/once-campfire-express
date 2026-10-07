@@ -18,8 +18,7 @@
     "bench:image:bun": "docker build -f Dockerfile.bun -t once-campfire-express:bun --build-arg REVISION=$(git rev-parse HEAD) .",
     "bench:reads": "ruby bench/compare.rb --concurrencies 16 --routes room_show,messages_page,sidebar,search --duration 4 --output tmp/bench/results/reads",
     "bench:writes": "ruby bench/compare.rb --concurrencies 16 --routes post_message --duration 15 --output tmp/bench/results/writes",
-    "bench:cable": "ruby bench/compare.rb --suites cable --cable-clients 100 --cable-tput-secs 0 --output tmp/bench/results/cable",
-    "bench": "npm run bench:reads && npm run bench:writes && npm run bench:cable",
+    "bench": "npm run bench:reads && npm run bench:writes",
     "snapshot": "node bench/snapshot.js --labels ../once-campfire-rust/parity/.seed/default/labels.json --base http://127.0.0.1:25190 --out",
     "snapshot:compare": "node bench/snapshot.js --compare"
   },
