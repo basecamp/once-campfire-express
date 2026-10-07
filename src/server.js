@@ -18,8 +18,8 @@ const workers = parseWebWorkers();
 const serves = workers === 1 || cluster.isWorker;
 
 initialize();
-// Cluster workers never checkpoint: the primary's checkpointer thread owns that, so request commits skip it.
-deferCheckpoints(db(), cluster.isWorker ? 0 : undefined);
+// The background thread normally checkpoints; every writer retains the 64 MB backstop.
+deferCheckpoints(db());
 let checkpointer, server;
 if (cluster.isPrimary) {
   const file = databaseFile();

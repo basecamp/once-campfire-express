@@ -146,7 +146,7 @@ the original schema):
   so completion order is not queue order. The jobs DB uses `synchronous=NORMAL`.
 - WAL checkpoints run on a background thread (`src/checkpoint.js`) in the primary: PASSIVE
   every 250 ms, TRUNCATE above 64 MB, forced RESTART above `CAMPFIRE_WAL_MAX_MB` (256).
-  Cluster web workers disable WAL autocheckpoint; single-process mode keeps a 64 MB backstop.
+  Every writer keeps a 64 MB autocheckpoint backstop if the background worker stalls.
 - `WEB_WORKERS` defaults to `auto`; cluster workers listen with `reusePort` on Linux
   (`REUSE_PORT=0` disables). HTML ETags are `W/"<length>-<fast hash>"`.
 - Action Cable keeps a per-stream subscriber index. A revoked or dead socket is cut off on
