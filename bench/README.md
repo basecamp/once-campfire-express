@@ -11,7 +11,7 @@ cd ../once-campfire-rust
 git submodule update --init reference
 parity/bin/reference build && parity/bin/seed build default
 docker build -t campfire-rust:app .
-(cd bench/loadgen && cargo build --release)
+cargo build --release --manifest-path bench/loadgen/Cargo.toml --target-dir target/bench
 ```
 
 Then, from this repository with the `reference` submodule checked out:
@@ -25,14 +25,16 @@ npm run bench             # bench:reads, bench:writes and bench:cable in turn
 Each suite writes `summary.json` and per-round JSON to `tmp/bench/results/{reads,writes,cable}/`.
 `--apps` picks a subset (default `express,express-bun,rust`). `LOADGEN`, `BENCH_ENV_FILE`,
 `RUST_IMAGE`, `EXPRESS_IMAGE` and `EXPRESS_BUN_IMAGE` override the defaults
-(`bench/loadgen/target/release/loadgen`, `parity/.env.reference`, `campfire-rust:app`,
+(`target/bench/release/loadgen`, `parity/.env.reference`, `campfire-rust:app`,
 `once-campfire-express:app`, `once-campfire-express:bun`); `<APP>_BENCH_ENV` (JSON) adds
 environment, e.g. `EXPRESS_BUN_BENCH_ENV='{"WEB_WORKERS":"3"}'`. Each run's metadata records
 the runtime per app. For other options, run `ruby bench/compare.rb --help`.
 
 Server processes share four hardware threads (`--cpus`); clients use separate threads
-(`--client-cpus`). The runner verifies exact ordered HTTP result windows, successful
-persisted writes, FTS entries, SQLite integrity and complete WebSocket delivery. It
+(`--client-cpus`). The shared Rust repository’s Ruby runner checks every response’s route contract and exact
+seeded result window, then matches each POST’s unique body and acknowledged message ID
+to its persisted row and FTS entry. Invalid responses, duplicate acknowledgements, SQLite
+corruption or incomplete WebSocket delivery fail the run. It
 replaces fixture push and webhook destinations with loopback test endpoints. Raw output
 stays in ignored `tmp/bench/`; no benchmark results are tracked.
 

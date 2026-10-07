@@ -9,6 +9,8 @@ import {
   searchMessages,
   directMembers,
   messagesForRoom,
+  messagesByIds,
+  refreshMessages,
   grantMemberships,
   createUser,
   createMessage,
@@ -581,21 +583,17 @@ export function registerRoutes(app) {
   app.get("/rooms/:roomId/refresh", login, (req, res) => {
     const room = required(roomForUser(req.user, req.params.roomId));
     const since = Number(req.query.since) || 0;
-    const messages = all(
-      "SELECT * FROM messages WHERE room_id=? ORDER BY created_at",
-      room.id,
-    )
-      .filter((m) => epoch(m.updated_at) > since)
-      .slice(-80);
+    const messages = refreshMessages(room.id, since);
+    const rendered = messageData(messagesByIds(messages.map((m) => m.id)));
     res.type("text/vnd.turbo-stream.html").send(
       messages
-        .map((m) => {
+        .map((m, i) => {
           const action = epoch(m.created_at) > since ? "append" : "replace",
             target =
               action === "append"
                 ? `messages_rooms_${room.type.split("::").pop().toLowerCase()}_${room.id}`
                 : "message_" + m.client_message_id;
-          return `<turbo-stream action="${action}" target="${target}"><template>${fragment("message", messageData([messageById(m.id)])[0])}</template></turbo-stream>`;
+          return `<turbo-stream action="${action}" target="${target}"><template>${fragment("message", rendered[i])}</template></turbo-stream>`;
         })
         .join(""),
     );

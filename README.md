@@ -44,6 +44,8 @@ with four hardware threads allocated to each app.
 
 ## Known differences
 
+- Search selects the newest 100 matching messages by insertion ID, then displays them in ID order. Backdated messages can appear in a different order from the original Rails app.
+
 - TLS terminates at a configured proxy.
 - CSRF: `Sec-Fetch-Site` replaces tokens. Writes accept `same-origin` and `same-site`,
   reject `cross-site`, `none` and missing headers over HTTPS with 422, and retain the

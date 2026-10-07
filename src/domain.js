@@ -46,6 +46,23 @@ export function messagesByIds(ids) {
   );
   return ids.map((id) => rows.get(id)).filter(Boolean);
 }
+export function refreshMessages(roomId, since) {
+  // The browser cursor is milliseconds, while SQLite stores microseconds. Match
+  // epoch(updated_at) > since without truncating the indexed column in SQL.
+  if (since >= 8640000000000000) return [];
+  const cutoff =
+    since <= -8640000000000000
+      ? ""
+      : new Date(Math.floor(since) + 1)
+          .toISOString()
+          .replace("T", " ")
+          .replace("Z", "");
+  return all(
+    "SELECT * FROM messages WHERE room_id=? AND updated_at>=? ORDER BY +created_at DESC,id DESC LIMIT 80",
+    roomId,
+    cutoff,
+  ).reverse();
+}
 // Read newest FTS matches without sorting the entire history. Sparse memberships
 // fall back after a bounded probe; hydration rechecks the current membership.
 export function searchMessages(user, query) {
