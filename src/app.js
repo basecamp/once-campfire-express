@@ -1,10 +1,20 @@
 import express from "express";
 import compression from "compression";
+import { splicedGzip } from "./gzip.js";
+import { frontCacheMiddleware } from "./front_cache.js";
 import multer from "multer";
 import path from "node:path";
+import fs from "node:fs";
 import { randomBytes } from "node:crypto";
 import * as rails from "./rails.js";
-import { get, run, now, initialize } from "./db.js";
+import {
+  get,
+  getCached,
+  run,
+  now,
+  initialize,
+  validateQueryCacheForTurn,
+} from "./db.js";
 import { registerRoutes } from "./routes.js";
 import { registerStorage } from "./storage.js";
 import { registerPublic } from "./public.js";
@@ -23,13 +33,10 @@ export function parseCookies(header = "") {
   }
   return result;
 }
-export function authenticateCookies(header) {
+export function authenticateCookies(header, cookies = parseCookies(header)) {
   try {
-    const token = rails.verifyCookie(
-      "session_token",
-      parseCookies(header).session_token,
-    );
-    return get(
+    const token = rails.verifyCookie("session_token", cookies.session_token);
+    return getCached(
       "SELECT s.*,u.name,u.role,u.status FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND u.status=0",
       token,
     );
@@ -38,6 +45,7 @@ export function authenticateCookies(header) {
   }
 }
 function sessionMiddleware(req, res, next) {
+  validateQueryCacheForTurn();
   req.cookies = parseCookies(req.headers.cookie);
   req.session = {};
   try {
@@ -49,20 +57,12 @@ function sessionMiddleware(req, res, next) {
       req.session = session;
   } catch {}
   const before = rails.stringify(req.session);
-  try {
-    if (rails.decode64(req.session._csrf_token).length !== 32)
-      delete req.session._csrf_token;
-  } catch {
-    delete req.session._csrf_token;
-  }
   req.session.session_id ||= randomBytes(16).toString("hex");
-  req.session._csrf_token ||= rails.b64(randomBytes(32));
-  req.csrfToken = rails.maskCsrf(rails.decode64(req.session._csrf_token));
-  req.currentSession = authenticateCookies(req.headers.cookie);
+  req.currentSession = authenticateCookies(req.headers.cookie, req.cookies);
   req.user = req.currentSession
-    ? get("SELECT * FROM users WHERE id=?", req.currentSession.user_id)
+    ? getCached("SELECT * FROM users WHERE id=?", req.currentSession.user_id)
     : null;
-  req.account = get("SELECT * FROM accounts ORDER BY id LIMIT 1");
+  req.account = getCached("SELECT * FROM accounts ORDER BY id LIMIT 1");
   req.authenticatedByBot = false;
   const botMatch = req.path.match(/^\/rooms\/\d+\/([^/]+)\/messages(?:\/|$)/);
   const botKey = req.query.bot_key || botMatch?.[1];
@@ -144,6 +144,41 @@ function multipartFields(req, res, next) {
   }
   next();
 }
+const assetsRoot = () => path.resolve("assets/generated/public/assets");
+function precompressedAssets() {
+  const root = assetsRoot();
+  const files = new Set(
+    fs.existsSync(root)
+      ? fs
+          .readdirSync(root, { recursive: true })
+          .map((f) => f.split(path.sep).join("/"))
+      : [],
+  );
+  const extensions = { br: ".br", gzip: ".gz" };
+  return (req, res, next) => {
+    if (req.method !== "GET" && req.method !== "HEAD") return next();
+    let name;
+    try {
+      name = decodeURIComponent(req.path).slice(1);
+    } catch {
+      return next();
+    }
+    if (!files.has(name)) return next();
+    const encoding = req.acceptsEncodings(["br", "gzip"]);
+    const variant = encoding && name + extensions[encoding];
+    if (!variant || !files.has(variant)) return next();
+    res.type(path.extname(name));
+    res.set({
+      "Content-Encoding": encoding,
+      Vary: "Accept-Encoding",
+    });
+    res.sendFile(
+      variant,
+      { root: assetsRoot(), immutable: true, maxAge: "1y", dotfiles: "deny" },
+      (error) => error && next(error),
+    );
+  };
+}
 export function createApp() {
   initialize();
   const app = express();
@@ -151,6 +186,7 @@ export function createApp() {
   app.set("query parser", "extended");
   if (process.env.TRUSTED_PROXIES)
     app.set("trust proxy", process.env.TRUSTED_PROXIES.split(","));
+  app.use(frontCacheMiddleware());
   app.use((req, res, next) => {
     res.set({
       "X-Content-Type-Options": "nosniff",
@@ -159,10 +195,12 @@ export function createApp() {
     });
     next();
   });
-  app.use(compression());
+  app.use(splicedGzip());
+  app.use(compression({ threshold: 1024, level: 6 }));
+  app.use("/assets", precompressedAssets());
   app.use(
     "/assets",
-    express.static(path.resolve("assets/generated/public/assets"), {
+    express.static(assetsRoot(), {
       immutable: true,
       maxAge: "1y",
       dotfiles: "deny",
@@ -210,7 +248,7 @@ export function createApp() {
   });
   app.use(sessionMiddleware);
   app.use((req, res, next) => {
-    if (get("SELECT id FROM bans WHERE ip_address=?", req.ip))
+    if (getCached("SELECT id FROM bans WHERE ip_address=?", req.ip))
       return res.sendStatus(403);
     if (
       req.authenticatedByBot &&
@@ -239,16 +277,13 @@ export function createApp() {
     const origin = req.headers.origin;
     if (origin && origin !== req.protocol + "://" + req.get("host"))
       return res.sendStatus(422);
-    if (
-      !rails.validCsrf(
-        rails.decode64(req.session._csrf_token),
-        req.headers["x-csrf-token"] || req.body?.authenticity_token,
-        req.path,
-        req.method,
-      )
-    )
-      return res.sendStatus(422);
-    next();
+    // Sec-Fetch-Site replaces Rails' per-request tokens so pages render identically until their
+    // content changes. Browsers omit the header only on plain HTTP (or when very old), where the
+    // SameSite=Lax session cookie and the Origin check above are the protection.
+    const site = req.headers["sec-fetch-site"];
+    if (site === "same-origin" || site === "same-site") return next();
+    if (site === undefined && !req.secure) return next();
+    res.sendStatus(422);
   });
   app.post("/session", (req, res, next) =>
     allowLogin(req.ip)

@@ -1,0 +1,51 @@
+<details class="notifications-help hide-in-browser" data-notifications-target="details">
+  <summary class="btn">
+    <img src="<%= asset("external/gear.svg") %>" aria-hidden="true" width="20" height="20">
+    <strong>Check your <%= dot?.Platform?.OperatingSystem %> settings</strong>
+    <img src="<%= asset("disclosure.svg") %>" aria-hidden="true" class="disclosure" width="10" height="10">
+  </summary>
+
+<% if ((dot?.Platform?.Firefox && dot?.Platform?.Android)) { %>      <ol>
+        <li>Tap the <em><img src="<%= asset("menu-dots-vertical.svg") %>" alt="More options" width="16" height="16"></em> menu button.</li>
+        <li>Tap <em>Settings</em>.</li>
+        <li>Tap <em>Notifications</em>.</li>
+        <li>Tap <em><img src="<%= asset("external/switch.svg") %>" alt="the toggle button" width="22" height="22"></em> to <em>Allow <%= dot?.Platform?.Browser %> notifications</em>.</li>
+      </ol>
+<% } else if ((dot?.Platform?.Edge && dot?.Platform?.Desktop)) { %>      <ol>
+        <li>Click <em>Start</em>, then <em>Settings</em>.</li>
+        <li>Go to <em>System &gt; Notification</em>.</li>
+        <li>Click <em><img src="<%= asset("external/switch.svg") %>" alt="the toggle button" width="22" height="22"></em> <em>ON</em> for Campfire.</li>
+      </ol>
+<% } else if ((((dot?.Platform?.Firefox || dot?.Platform?.Chrome)) && dot?.Platform?.Desktop)) { %>      <ol>
+<% if (dot?.Platform?.Windows) { %>          <li>Click <em>Start</em>, then <em>Settings</em>.</li>
+          <li>Go to <em>System &gt; Notification</em>.</li>
+          <li>Click <em><img src="<%= asset("external/switch.svg") %>" alt="the toggle button" width="22" height="22"></em> <em>ON</em> for Campfire.</li>
+<% } else { %>          <li>Click <em aria-label="the Apple menu"></em> in the top left.</li>
+          <li>Click <em>System Settings…</em>.</li>
+          <li>Click <em>Notifications</em>.</li>
+          <li>Click <em>Campfire</em>.</li>
+          <li>Click <em><img src="<%= asset("external/switch.svg") %>" alt="the allow notifications switch" width="22" height="22"></em> to <em>Allow notifications</em>.</li>
+<% } %>      </ol>
+<% } else if ((dot?.Platform?.Safari && dot?.Platform?.Desktop)) { %>      <ol>
+        <li>Click <em aria-label="the Apple menu"></em> in the top left.</li>
+        <li>Click <em>System Settings…</em>.</li>
+        <li>Click <em>Notifications</em>.</li>
+        <li>Click <em>Campfire</em>.</li>
+        <li>Click <em><img src="<%= asset("external/switch.svg") %>" alt="the allow notifications switch" width="22" height="22"></em> to <em>Allow notifications</em>.</li>
+      </ol>
+<% } else if ((((dot?.Platform?.Safari || dot?.Platform?.Chrome)) && dot?.Platform?.IOS)) { %>      <ol>
+        <li>Open the <em><img src="<%= asset("external/gear.svg") %>" aria-hidden="true" width="20" height="20"></em> Settings app.</li>
+        <li>Scroll to and tap <em>Campfire</em>.</li>
+        <li>Tap <em>Notifications</em>.</li>
+        <li>Tap <em><img src="<%= asset("external/switch.svg") %>" alt="the allow notifications switch button" width="22" height="22"></em> to <em>Allow Notifications</em>.</li>
+      </ol>
+<% } else if ((dot?.Platform?.Chrome && dot?.Platform?.Android)) { %>      <ol>
+        <li>Open the <em><img src="<%= asset("external/gear.svg") %>" aria-hidden="true" width="20" height="20"></em> Settings app.</li>
+        <li>Tap <em>Notifications</em>.</li>
+        <li>Tap <em>App notifications</em>.</li>
+        <li>Scroll to <em>Campfire</em>.</li>
+        <li>Tap <em><img src="<%= asset("external/switch.svg") %>" alt="the switch" width="22" height="22"></em> to <em>Allow Notifications</em>.</li>
+      </ol>
+<% } else { %>      <p>Ensure notifications are allowed for <%= dot?.Platform?.Browser %> in your system settings.</p>
+<% } %></details>
+

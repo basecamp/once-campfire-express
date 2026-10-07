@@ -1,11 +1,12 @@
-import { DatabaseSync } from "node:sqlite";
+import cluster from "node:cluster";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import dns from "node:dns/promises";
 import net from "node:net";
 import webpush from "web-push";
-import { get, all, run } from "./db.js";
+import { get, all, run, applyDurabilityPragmas } from "./db.js";
+import { openDatabase } from "./sqlite.js";
 import { publicAddress, resolvePublic, requestPinned } from "./opengraph.js";
 import {
   purgeBlob,
@@ -16,8 +17,15 @@ import {
 
 let connection,
   timer,
-  working = false,
-  stopping = false;
+  stopping = false,
+  active = 0;
+const statements = new Map();
+const idle = [];
+function statement(sql) {
+  let prepared = statements.get(sql);
+  if (!prepared) statements.set(sql, (prepared = jobsDb().prepare(sql)));
+  return prepared;
+}
 export function jobsDb() {
   if (connection) return connection;
   const file =
@@ -29,34 +37,146 @@ export function jobsDb() {
       "db/jobs.sqlite3",
     );
   fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
-  connection = new DatabaseSync(file);
+  connection = openDatabase(file);
+  connection.exec("PRAGMA busy_timeout=10000");
+  applyDurabilityPragmas(connection);
   connection.exec(
-    "PRAGMA busy_timeout=10000;PRAGMA journal_mode=WAL;CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY,payload TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,available_at REAL NOT NULL,lease_until REAL,lease_token TEXT,status TEXT NOT NULL DEFAULT 'ready',last_error TEXT)",
+    "CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY,payload TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,available_at REAL NOT NULL,lease_until REAL,lease_token TEXT,status TEXT NOT NULL DEFAULT 'ready',last_error TEXT)",
   );
+  statements.clear();
   return connection;
 }
 export function enqueue(kind, data) {
-  return Number(
-    jobsDb()
-      .prepare("INSERT INTO jobs(payload,available_at) VALUES(?,?)")
-      .run(JSON.stringify({ kind, data }), Date.now() / 1000).lastInsertRowid,
+  return enqueueMany([{ kind, data }])[0];
+}
+export function enqueueMany(list, at = Date.now() / 1000) {
+  const db = jobsDb(),
+    insert = statement("INSERT INTO jobs(payload,available_at) VALUES(?,?)");
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const ids = list.map(({ kind, data }) =>
+      Number(insert.run(JSON.stringify({ kind, data }), at).lastInsertRowid),
+    );
+    db.exec("COMMIT");
+    return ids;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function logLostJobs(list, error) {
+  const payloads = JSON.stringify(list, (key, value) =>
+    typeof value === "bigint" ? String(value) : value,
   );
+  console.error(
+    `Campfire enqueue of ${list.length} jobs failed: ${error.message}; lost payloads: ${payloads}`,
+  );
+}
+let buffered = [],
+  flushScheduled = false;
+const handoffs = new Set();
+// Coalesces every batch that arrives within one event-loop turn into a single jobs-DB commit.
+export function enqueueSoon(list) {
+  if (!list.length) return;
+  buffered.push(...list);
+  if (!flushScheduled) {
+    flushScheduled = true;
+    setImmediate(flushJobs);
+  }
+}
+export function flushJobs() {
+  flushScheduled = false;
+  if (!buffered.length) return 0;
+  const batch = buffered;
+  buffered = [];
+  try {
+    enqueueMany(batch);
+  } catch (error) {
+    logLostJobs(batch, error);
+    return 0;
+  }
+  if (timer && !stopping) fill();
+  return batch.length;
+}
+// Cluster workers hand jobs to the primary so it is the only jobs-DB writer on the hot path.
+export function submitJobs(list) {
+  if (!list.length) return;
+  if (!cluster.isWorker || !process.connected) return enqueueSoon(list);
+  const handoff = new Promise((resolve) => {
+    const fallback = (error) => {
+      console.error(
+        `Campfire job handoff to primary failed (${error.message}); enqueueing locally`,
+      );
+      try {
+        enqueueMany(list);
+      } catch (failure) {
+        logLostJobs(list, failure);
+      }
+    };
+    try {
+      process.send(
+        { type: "jobs", jobs: list },
+        undefined,
+        undefined,
+        (error) => {
+          if (error) fallback(error);
+          resolve();
+        },
+      );
+    } catch (error) {
+      fallback(error);
+      resolve();
+    }
+  });
+  handoffs.add(handoff);
+  handoff.finally(() => handoffs.delete(handoff));
+}
+export function acceptJobsMessage(event) {
+  if (event?.type !== "jobs" || !Array.isArray(event.jobs)) return false;
+  enqueueSoon(event.jobs);
+  return true;
+}
+// The response is already on the wire; work deferred here is lost only if the process dies hard before it runs.
+export function afterResponse(res, work) {
+  let settle;
+  const deferred = new Promise((resolve) => (settle = resolve));
+  let started = false;
+  const start = () => {
+    if (started) return;
+    started = true;
+    setImmediate(() => {
+      try {
+        work();
+      } catch (error) {
+        console.error("Campfire deferred work failed:", error);
+      } finally {
+        settle();
+      }
+    });
+  };
+  if (res.writableFinished || res.destroyed) start();
+  res.once("finish", start);
+  res.once("close", start);
+  handoffs.add(deferred);
+  deferred.finally(() => handoffs.delete(deferred));
+}
+export async function settleJobHandoffs() {
+  while (handoffs.size) await Promise.all([...handoffs]);
 }
 export function claim(at = Date.now() / 1000) {
   const db = jobsDb();
   db.exec("BEGIN IMMEDIATE");
   try {
-    const row = db
-      .prepare(
-        "SELECT * FROM jobs WHERE status='ready' AND available_at<=? AND (lease_until IS NULL OR lease_until<=?) ORDER BY id LIMIT 1",
-      )
-      .get(at, at);
+    const row = statement(
+      "SELECT * FROM jobs WHERE status='ready' AND available_at<=? AND (lease_until IS NULL OR lease_until<=?) ORDER BY id LIMIT 1",
+    ).get(at, at);
     if (!row) {
       db.exec("COMMIT");
       return null;
     }
     const token = crypto.randomBytes(16).toString("hex");
-    db.prepare(
+    statement(
       "UPDATE jobs SET attempts=attempts+1,lease_until=?,lease_token=? WHERE id=?",
     ).run(at + 120, token, row.id);
     db.exec("COMMIT");
@@ -72,22 +192,20 @@ export function claim(at = Date.now() / 1000) {
   }
 }
 export function finish(job, error = null, at = Date.now() / 1000) {
-  const db = jobsDb();
   if (!error)
-    return db
-      .prepare("DELETE FROM jobs WHERE id=? AND lease_token=?")
-      .run(job.id, job.lease_token).changes;
-  return db
-    .prepare(
-      "UPDATE jobs SET lease_until=NULL,lease_token=NULL,available_at=?,status=?,last_error=? WHERE id=? AND lease_token=?",
-    )
-    .run(
-      at + Math.min(300, 2 ** job.attempts),
-      job.attempts >= 5 ? "dead" : "ready",
-      String(error).slice(0, 1000),
+    return statement("DELETE FROM jobs WHERE id=? AND lease_token=?").run(
       job.id,
       job.lease_token,
     ).changes;
+  return statement(
+    "UPDATE jobs SET lease_until=NULL,lease_token=NULL,available_at=?,status=?,last_error=? WHERE id=? AND lease_token=?",
+  ).run(
+    at + Math.min(300, 2 ** job.attempts),
+    job.attempts >= 5 ? "dead" : "ready",
+    String(error).slice(0, 1000),
+    job.id,
+    job.lease_token,
+  ).changes;
 }
 export async function perform(kind, data) {
   if (kind === "purge") {
@@ -293,14 +411,12 @@ export async function perform(kind, data) {
     }
   } else throw new Error(`unknown job ${kind}`);
 }
-export async function workOnce() {
-  const job = claim();
-  if (!job) return false;
+async function execute(job) {
   const heartbeat = setInterval(() => {
     try {
-      jobsDb()
-        .prepare("UPDATE jobs SET lease_until=? WHERE id=? AND lease_token=?")
-        .run(Date.now() / 1000 + 120, job.id, job.lease_token);
+      statement(
+        "UPDATE jobs SET lease_until=? WHERE id=? AND lease_token=?",
+      ).run(Date.now() / 1000 + 120, job.id, job.lease_token);
     } catch (error) {
       console.error("Campfire lease renewal failed:", error.message);
     }
@@ -311,32 +427,63 @@ export async function workOnce() {
     await perform(payload.kind, payload.data);
     finish(job);
   } catch (error) {
-    finish(job, error);
     console.error("Campfire job failed:", error.message);
+    try {
+      finish(job, error);
+    } catch (failure) {
+      console.error("Campfire job bookkeeping failed:", failure.message);
+    }
   } finally {
     clearInterval(heartbeat);
   }
+}
+export async function workOnce() {
+  const job = claim();
+  if (!job) return false;
+  await execute(job);
   return true;
+}
+export function jobConcurrency() {
+  const value = Number(process.env.JOB_CONCURRENCY);
+  return Number.isInteger(value) && value > 0 ? value : 3;
+}
+export const activeJobs = () => active;
+function fill() {
+  const limit = jobConcurrency();
+  while (!stopping && active < limit) {
+    let job;
+    try {
+      job = claim();
+    } catch (error) {
+      console.error("Campfire queue failed:", error.message);
+      break;
+    }
+    if (!job) break;
+    active++;
+    execute(job).finally(() => {
+      active--;
+      fill();
+      if (!active) for (const resolve of idle.splice(0)) resolve();
+    });
+  }
+}
+// Resolves once nothing is running and the last claim found no ready job.
+export function drainQueue() {
+  fill();
+  return active
+    ? new Promise((resolve) => idle.push(resolve))
+    : Promise.resolve();
 }
 export function startWorker() {
   if (timer) return;
   stopping = false;
-  timer = setInterval(async () => {
-    if (working || stopping) return;
-    working = true;
-    try {
-      await workOnce();
-    } catch (error) {
-      console.error("Campfire queue failed:", error.message);
-    } finally {
-      working = false;
-    }
-  }, 250);
+  timer = setInterval(fill, 250);
   timer.unref();
+  fill();
 }
 export async function stopWorker() {
   stopping = true;
   clearInterval(timer);
   timer = null;
-  while (working) await new Promise((resolve) => setTimeout(resolve, 25));
+  if (active) await new Promise((resolve) => idle.push(resolve));
 }

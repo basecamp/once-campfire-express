@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import zlib from "node:zlib";
 const root = path.resolve(import.meta.dirname, ".."),
   reference = path.join(root, "reference"),
   sources = path.join(root, "assets/sources"),
@@ -94,6 +95,7 @@ for (const [name, data] of assets) {
     : name.replace(/\.(\w+(?:\.map)?)$/, `-${digest}.$1`);
   manifest[name] = { digested_path: digested, integrity: null };
 }
+const precompressible = /\.(css|js|svg|json|txt|html|map|webmanifest)$/;
 const url = (name) => "/assets/" + manifest[name].digested_path;
 fs.rmSync(out, { recursive: true, force: true });
 fs.mkdirSync(path.join(out, "public/assets"), { recursive: true });
@@ -135,6 +137,15 @@ for (const [name, data] of assets) {
   const dest = path.join(out, "public/assets", manifest[name].digested_path);
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   fs.writeFileSync(dest, compiled);
+  if (precompressible.test(dest) && compiled.length >= 1024) {
+    fs.writeFileSync(dest + ".gz", zlib.gzipSync(compiled, { level: 9 }));
+    fs.writeFileSync(
+      dest + ".br",
+      zlib.brotliCompressSync(compiled, {
+        params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 11 },
+      }),
+    );
+  }
 }
 const serialized = JSON.stringify(manifest);
 fs.writeFileSync(path.join(out, "manifest.json"), serialized);

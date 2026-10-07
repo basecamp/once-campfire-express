@@ -1,0 +1,1 @@
+<%~ partials.layout_start(dot) %><% for (const item3 of each(dot?.Messages)) { %><%~ partials.boosts(item3) %><% } %><%~ partials.layout_end(dot) %>

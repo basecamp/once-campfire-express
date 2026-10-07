@@ -1,6 +1,6 @@
 import { WebSocketServer, WebSocket } from "ws";
 import cluster from "node:cluster";
-import { get, run, now, transaction } from "./db.js";
+import { get, run, now, transaction, writeEpoch } from "./db.js";
 import * as rails from "./rails.js";
 // Keep the socket module independent from the HTTP router to avoid import cycles.
 function identity(header = "") {
@@ -20,14 +20,59 @@ function identity(header = "") {
   }
 }
 const clients = new Set();
+const streamIndex = new Map();
+export const indexedSubscriptions = () => {
+  let n = 0;
+  for (const subs of streamIndex.values()) n += subs.size;
+  return n;
+};
+function unindex(sub) {
+  const subs = streamIndex.get(sub.stream);
+  if (!subs) return;
+  subs.delete(sub);
+  if (!subs.size) streamIndex.delete(sub.stream);
+}
+function removeSubscription(client, identifier) {
+  const sub = client.subscriptions.get(identifier);
+  if (!sub) return;
+  client.subscriptions.delete(identifier);
+  unindex(sub);
+}
+function addSubscription(client, identifier, sub) {
+  removeSubscription(client, identifier);
+  sub.client = client;
+  sub.identifier = identifier;
+  client.subscriptions.set(identifier, sub);
+  let subs = streamIndex.get(sub.stream);
+  if (!subs) streamIndex.set(sub.stream, (subs = new Set()));
+  subs.add(sub);
+}
+const AUTH_TTL = Number(process.env.CABLE_AUTH_TTL_MS || 1000);
+let authCheckCount = 0;
+export const authChecks = () => authCheckCount;
+// Reuse authorization only while this connection and all external writers are unchanged.
 function alive(client) {
-  return Boolean(
+  const at = Date.now();
+  const version = `${get("PRAGMA data_version").data_version}:${writeEpoch()}`;
+  if (client.aliveUntil > at && client.authVersion === version) return true;
+  client.authVersion = version;
+  authCheckCount++;
+  const ok = Boolean(
     get(
       "SELECT s.id FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id=? AND s.user_id=? AND u.status=0 AND u.role<>2",
       client.session_id,
       client.user_id,
     ),
   );
+  client.aliveUntil = ok ? at + AUTH_TTL : 0;
+  return ok;
+}
+export function forgetUser(userId) {
+  for (const client of clients) {
+    if (client.user_id !== Number(userId)) continue;
+    client.aliveUntil = 0;
+    for (const sub of client.subscriptions.values()) sub.authorizedUntil = 0;
+  }
 }
 function authorize(client, identifier) {
   try {
@@ -88,16 +133,32 @@ function authorize(client, identifier) {
     return null;
   }
 }
-function frame(client, value) {
+function sendRaw(client, text) {
   if (client.ws.readyState !== WebSocket.OPEN) return;
   if (client.ws.bufferedAmount > 1024 * 1024) {
     client.ws.close(1013, "slow consumer");
     return;
   }
-  client.ws.send(JSON.stringify(value));
+  client.ws.send(text);
 }
-export function deliver(stream, message) {
-  for (const client of clients) {
+function frame(client, value) {
+  sendRaw(client, JSON.stringify(value));
+}
+export function broadcastFrame(cache, identifier, message) {
+  let text = cache.get(identifier);
+  if (text === undefined) {
+    text = JSON.stringify({ identifier, message });
+    cache.set(identifier, text);
+  }
+  return text;
+}
+function deliverOne(stream, message) {
+  const subs = streamIndex.get(stream);
+  if (!subs) return;
+  const frames = new Map();
+  for (const sub of subs) {
+    const { client, identifier } = sub;
+    if (client.ws.readyState !== WebSocket.OPEN) continue;
     if (!alive(client)) {
       frame(client, {
         type: "disconnect",
@@ -107,24 +168,38 @@ export function deliver(stream, message) {
       client.ws.close(1008);
       continue;
     }
-    for (const [identifier, sub] of client.subscriptions) {
-      if (sub.stream !== stream) continue;
+    if (
+      !(sub.authorizedUntil > Date.now()) ||
+      sub.authVersion !== client.authVersion
+    ) {
       if (!authorize(client, identifier)) {
-        client.subscriptions.delete(identifier);
+        removeSubscription(client, identifier);
         frame(client, { type: "reject_subscription", identifier });
         continue;
       }
-      frame(client, { identifier, message });
+      sub.authorizedUntil = Date.now() + AUTH_TTL;
+      sub.authVersion = client.authVersion;
     }
+    sendRaw(client, broadcastFrame(frames, identifier, message));
+  }
+}
+export function deliver(stream, message) {
+  deliverOne(stream, message);
+}
+export function deliverBatch(events) {
+  for (const event of events) deliverOne(event.stream, event.message);
+}
+export function publishMany(events) {
+  if (!events.length) return;
+  if (cluster.isWorker) process.send?.({ type: "cable-batch", events });
+  else {
+    deliverBatch(events);
+    for (const worker of Object.values(cluster.workers || {}))
+      worker.send({ type: "cable-batch", events });
   }
 }
 export function publish(stream, message) {
-  if (cluster.isWorker) process.send?.({ type: "cable", stream, message });
-  else {
-    deliver(stream, message);
-    for (const worker of Object.values(cluster.workers || {}))
-      worker.send({ type: "cable", stream, message });
-  }
+  publishMany([{ stream, message }]);
 }
 function presence(user, room, action) {
   transaction(() => {
@@ -229,13 +304,13 @@ export function attachCable(server) {
               sub.present = existing ? existing.present : true;
               if (!existing) presence(client.user_id, sub.room, "present");
             }
-            client.subscriptions.set(identifier, sub);
+            addSubscription(client, identifier, sub);
             frame(client, { type: "confirm_subscription", identifier });
           } else if (msg.command === "unsubscribe") {
             const sub = client.subscriptions.get(identifier);
             if (sub?.channel === "PresenceChannel" && sub.present)
               presence(client.user_id, sub.room, "absent");
-            client.subscriptions.delete(identifier);
+            removeSubscription(client, identifier);
           } else if (
             msg.command === "message" &&
             client.subscriptions.has(identifier)
@@ -269,9 +344,12 @@ export function attachCable(server) {
       });
       ws.on("close", () => {
         clients.delete(client);
-        for (const sub of client.subscriptions.values())
+        for (const sub of client.subscriptions.values()) {
+          unindex(sub);
           if (sub.channel === "PresenceChannel" && sub.present)
             presence(client.user_id, sub.room, "absent");
+        }
+        client.subscriptions.clear();
       });
     });
   });
@@ -297,6 +375,7 @@ export function attachCable(server) {
   if (cluster.isWorker)
     process.on("message", (event) => {
       if (event?.type === "cable") deliver(event.stream, event.message);
+      else if (event?.type === "cable-batch") deliverBatch(event.events);
     });
   return wss;
 }

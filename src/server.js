@@ -1,21 +1,36 @@
 import cluster from "node:cluster";
 import http from "node:http";
-import { initialize } from "./db.js";
+import { initialize, deferCheckpoints, databaseFile, db } from "./db.js";
+import { parseWebWorkers } from "./workers.js";
 import { createApp } from "./app.js";
-import { attachCable, deliver } from "./cable.js";
-import { startWorker, stopWorker } from "./jobs.js";
+import { attachCable } from "./cable.js";
+import {
+  startWorker,
+  stopWorker,
+  acceptJobsMessage,
+  flushJobs,
+  settleJobHandoffs,
+} from "./jobs.js";
+import { startCheckpointer } from "./checkpoint.js";
+
 let shuttingDown = false;
-const workers = Number(process.env.WEB_WORKERS || "1");
-if (!Number.isInteger(workers) || workers < 1 || workers > 64)
-  throw new Error("WEB_WORKERS must be between 1 and 64");
+const workers = parseWebWorkers();
+const serves = workers === 1 || cluster.isWorker;
+
+initialize();
+// Cluster workers never checkpoint: the primary's checkpointer thread owns that, so request commits skip it.
+deferCheckpoints(db(), cluster.isWorker ? 0 : undefined);
+let checkpointer, server;
 if (cluster.isPrimary) {
-  initialize();
-  await startWorker();
+  const file = databaseFile();
+  if (file && file !== ":memory:") checkpointer = startCheckpointer(file);
+  startWorker();
   if (workers > 1) {
     for (let i = 0; i < workers; i++) cluster.fork();
     cluster.on("message", (worker, event) => {
-      if (event?.type === "cable")
+      if (event?.type === "cable" || event?.type === "cable-batch")
         for (const w of Object.values(cluster.workers)) w.send(event);
+      else acceptJobsMessage(event);
     });
     cluster.on("exit", (worker, code, signal) => {
       if (!shuttingDown) {
@@ -25,31 +40,87 @@ if (cluster.isPrimary) {
     });
   }
 }
-if (workers === 1 || cluster.isWorker) {
-  const server = http.createServer(createApp());
+if (serves) {
+  server = http.createServer(createApp());
   attachCable(server);
-  server.listen(
-    Number(process.env.HTTP_PORT || 8080),
-    process.env.BIND || "0.0.0.0",
-    () =>
-      console.log(
-        `Campfire Express listening on ${process.env.HTTP_PORT || 8080}`,
-      ),
+  listen();
+}
+
+function listen() {
+  const port = Number(process.env.HTTP_PORT || 8080);
+  const host = process.env.BIND || "0.0.0.0";
+  const announce = () => console.log(`Campfire Express listening on ${port}`);
+  const reusePort =
+    cluster.isWorker &&
+    process.platform === "linux" &&
+    process.env.REUSE_PORT !== "0";
+  if (!reusePort) return server.listen(port, host, announce);
+  const fallback = (error) => {
+    console.error(
+      `reusePort listen failed (${error.code || error.message}); using shared listen`,
+    );
+    server.listen(port, host, announce);
+  };
+  server.once("error", fallback);
+  try {
+    server.listen({ port, host, reusePort: true, exclusive: true }, () => {
+      server.off("error", fallback);
+      announce();
+    });
+  } catch (error) {
+    server.off("error", fallback);
+    fallback(error);
+  }
+}
+
+function closeServer() {
+  if (!server) return Promise.resolve();
+  return new Promise((resolve) => {
+    server.close(() => resolve());
+    server.closeIdleConnections?.();
+  });
+}
+function workersExited() {
+  const alive = Object.values(cluster.workers || {});
+  return Promise.all(
+    alive.map(
+      (w) =>
+        new Promise((resolve) => {
+          if (w.isDead()) return resolve();
+          // "disconnect" means the primary has read every message the worker sent, so no job batch is still in the pipe.
+          let pending = 2;
+          const done = () => --pending || resolve();
+          w.once("exit", done);
+          if (!w.isConnected()) return done();
+          w.once("disconnect", done);
+          w.send({ type: "shutdown" });
+        }),
+    ),
   );
-  const close = () => {
-    server.close();
-    setTimeout(() => process.exit(0), 5000).unref();
-  };
-  process.on("SIGTERM", close);
-  process.on("SIGINT", close);
 }
-if (cluster.isPrimary) {
-  const close = async () => {
-    shuttingDown = true;
-    await stopWorker();
-    for (const w of Object.values(cluster.workers || {})) w.disconnect();
-    setTimeout(() => process.exit(0), 5000).unref();
-  };
-  process.on("SIGTERM", close);
-  process.on("SIGINT", close);
+// Jobs deferred past the response live only in memory until committed, so every exit path drains them first.
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  setTimeout(
+    () => {
+      if (cluster.isPrimary) flushJobs();
+      process.exit(0);
+    },
+    cluster.isPrimary ? 8000 : 5000,
+  ).unref();
+  await closeServer();
+  await settleJobHandoffs();
+  if (cluster.isPrimary) {
+    await Promise.all([workersExited(), stopWorker()]);
+    flushJobs();
+    await checkpointer?.stop();
+  }
+  process.exit(0);
 }
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
+if (cluster.isWorker)
+  process.on("message", (event) => {
+    if (event?.type === "shutdown") shutdown();
+  });

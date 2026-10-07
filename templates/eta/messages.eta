@@ -1,0 +1,1 @@
+<% if (dot?.MessagesHTML) { %><%= dot?.MessagesHTML %><% } else { %><% for (const item1 of each(dot?.Messages)) { %><%~ partials.message(item1) %><% } %><% } %>

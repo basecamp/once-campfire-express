@@ -1,0 +1,8 @@
+<% if (dot?.Frame) { %><html><head></head><body><% } else { %><%~ partials.layout_start(dot) %><% } %>
+<div class="panel center"><header><h1 class="txt-x-large txt-tight-lines txt-align-center margin-none-block-start margin-block-end">Upgrade to a supported web browser</h1><div class="flex align-start gap"><%= translate("incompatible_browser_messsage") %><p class="margin-none-block-start">Campfire requires a modern web browser. Please use one of the browsers listed below and make sure auto-updates are enabled.</p></div></header>
+<div class="browser-list flex align-center flex-wrap gap justify-center margin-block">
+<div class="browser flex flex-column"><img src="<%= asset("browsers/safari.svg") %>" aria-hidden="true" class="center"><div class="flex flex-column align-center margin-block-start-half"><strong>Safari</strong><span> 17.2+</span></div></div>
+<div class="browser flex flex-column"><img src="<%= asset("browsers/chrome.svg") %>" aria-hidden="true" class="center"><div class="flex flex-column align-center margin-block-start-half"><strong>Chrome</strong><span> 120+</span></div></div>
+<div class="browser flex flex-column"><img src="<%= asset("browsers/firefox.svg") %>" aria-hidden="true" class="center"><div class="flex flex-column align-center margin-block-start-half"><strong>Firefox</strong><span> 121+</span></div></div>
+<div class="browser flex flex-column"><img src="<%= asset("browsers/opera.svg") %>" aria-hidden="true" class="center"><div class="flex flex-column align-center margin-block-start-half"><strong>Opera</strong><span> 104+</span></div></div>
+</div></div><% if (dot?.Frame) { %></body></html><% } else { %><%~ partials.layout_end(dot) %><% } %>

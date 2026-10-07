@@ -1,0 +1,1 @@
+<% if (dot?.NextPage) { %><turbo-frame id="next_page_container" loading="lazy" src="/account/users.turbo_stream?page=<%= dot?.NextPage %>" class="flex center"><div class="spinner center"></div></turbo-frame><% } %>

@@ -1,0 +1,11 @@
+<lexxy-prompt-item search="<%= dot?.Mention?.Name %>" sgid="<%= dot?.Mention?.SGID %>">
+  <template type="menu">
+    <span class="autocomplete__item flex align-center gap unpad">
+      <a title="<%= dot?.Mention?.Title %>" class="btn avatar" data-turbo-frame="_top" href="<%= dot?.Mention?.Path %>"><img aria-hidden="true" src="<%= dot?.Mention?.Avatar %>" width="48" height="48" /></a>
+      <span class="autocompletable__name"><%= dot?.Mention?.Name %></span>
+    </span>
+  </template>
+  <template type="editor">
+    <%= dot?.HTML %>
+  </template>
+</lexxy-prompt-item>

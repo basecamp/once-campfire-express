@@ -1,0 +1,8 @@
+<div id="message_<%= dot?.ClientID %>" class="message <% if (dot?.AllEmoji) { %>message--emoji<% } %>" data-controller="reply" data-user-id="<%= dot?.CreatorID %>" data-message-id="<%= dot?.ID %>" data-message-timestamp="<%= epoch(dot?.CreatedAt) %>" data-message-updated-at="<%= epoch(dot?.UpdatedAt) %>" data-sort-value="<%= epoch(dot?.CreatedAt) %>" data-messages-target="message" data-search-results-target="message" data-refresh-room-target="message" data-reply-composer-outlet="#composer">
+<h2 class="message__day-separator"><time datetime="<%= iso(dot?.CreatedAt) %>" data-local-time-target="date"></time></h2>
+<figure class="avatar message__avatar"><a title="<%= dot?.CreatorTitle %>" class="btn avatar" data-turbo-frame="_top" href="/users/<%= dot?.CreatorID %>"><img aria-hidden="true" src="<%= avatar(dot?.CreatorID, dot?.CreatorUpdatedAt) %>" width="48" height="48"></a></figure>
+<turbo-frame id="edit_message_<%= dot?.ClientID %>"><div class="message__body"><div class="message__body-content"><div class="message__meta"><h3 class="message__heading"><span class="message__author" title="<%= dot?.CreatorTitle %>"><strong data-reply-target="author"><%= dot?.Creator %></strong></span><a target="_top" class="message__permalink" href="/rooms/<%= dot?.RoomID %>/@<%= dot?.ID %>"><time class="message__timestamp" datetime="<%= iso(dot?.CreatedAt) %>" data-local-time-target="time"></time></a><span class="message__room"> <a target="_top" data-reply-target="link" href="/rooms/<%= dot?.RoomID %>/@<%= dot?.ID %>"><%= dot?.RoomName %></a></span></h3>
+<%~ partials.message_actions(dot) %></div>
+<%~ partials.presentation(dot) %>
+<%~ partials.boosts(dot) %>
+</div></div></turbo-frame></div>

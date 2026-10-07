@@ -1,0 +1,1 @@
+<turbo-stream action="replace" target="next_page_container"><template><%~ partials.account_users(dot) %></template></turbo-stream><% if (dot?.NextPage) { %><turbo-stream action="append" target="account_users"><template><%~ partials.account_next_page(dot) %></template></turbo-stream><% } %>

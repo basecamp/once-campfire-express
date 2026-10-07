@@ -1,11 +1,13 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import bcrypt from "bcryptjs";
-import { all, get, run, transaction, now } from "./db.js";
+import { all, get, run, transaction, now, touch } from "./db.js";
 import {
   roomForUser,
   roomsForUser,
   userById,
   messageById,
+  messagesByIds,
+  directMembers,
   messagesForRoom,
   grantMemberships,
   createUser,
@@ -21,15 +23,20 @@ import {
   render,
   fragment,
   messageData,
+  cachedMessages,
+  cachedSidebarDirects,
+  messageCacheKeys,
   roomData,
   userData,
   avatar,
   iso,
   epoch,
+  safe,
 } from "./rendering.js";
 import { escape, plainText, messagePlainText } from "./richtext.js";
+import { beginPage, sendCachedPage } from "./response_cache.js";
 import * as rails from "./rails.js";
-import { publish } from "./cable.js";
+import { publish, forgetUser } from "./cable.js";
 import {
   storeUpload,
   attachSigned,
@@ -41,6 +48,8 @@ import {
 } from "./storage.js";
 import { enqueue } from "./jobs.js";
 const token = () => randomBytes(18).toString("base64url");
+const messagesEtag = (keys) =>
+  `W/"${createHash("sha1").update(keys.join("|")).digest("hex")}"`;
 const origin = (req) => `${req.protocol}://${req.get("host")}`;
 export function value(req, group, key, fallback = "") {
   const result =
@@ -238,8 +247,10 @@ export function registerRoutes(app) {
     );
   });
   app.delete("/session", (req, res) => {
-    if (req.currentSession)
+    if (req.currentSession) {
       run("DELETE FROM sessions WHERE id=?", req.currentSession.id);
+      forgetUser(req.currentSession.user_id);
+    }
     if (req.user)
       run(
         "DELETE FROM push_subscriptions WHERE user_id=? AND endpoint=?",
@@ -315,7 +326,7 @@ export function registerRoutes(app) {
       return res
         .type("html")
         .send(
-          `<form method="post"><input name="_method" value="put" type="hidden"><input name="authenticity_token" value="${escape(req.csrfToken)}" type="hidden"><button>Sign in to Campfire</button></form>`,
+          `<form method="post"><input name="_method" value="put" type="hidden"><button>Sign in to Campfire</button></form>`,
         );
     if (!["PUT", "PATCH"].includes(req.method)) return res.sendStatus(405);
     let id;
@@ -339,26 +350,29 @@ export function registerRoutes(app) {
     login,
     (req, res) => {
       if (!/^\d+$/.test(req.params.roomId)) return res.sendStatus(404);
+      beginPage(req);
       const room = roomForUser(req.user, req.params.roomId);
       if (!room) return res.redirect("/");
+      // Cookies come from these session values on every request, cache hit or not.
       req.lastRoom = room.id;
       req.session.last_room_id = room.id;
-      const membership = get(
-        "SELECT involvement FROM memberships WHERE room_id=? AND user_id=?",
-        room.id,
-        req.user.id,
+      sendCachedPage(req, res, "room", () =>
+        render(req, "room", {
+          Room: roomData(room, req.user),
+          Messages: cachedMessages(
+            messagesForRoom(room.id, { around: req.params.messageId }),
+            origin(req),
+          ),
+          LoadedAt: epoch(room.updated_at),
+          Stream: rails.signStream(rails.stream(room)),
+          Involvement: get(
+            "SELECT involvement FROM memberships WHERE room_id=? AND user_id=?",
+            room.id,
+            req.user.id,
+          ).involvement,
+          Invitation: false,
+        }),
       );
-      send(req, res, "room", {
-        Room: roomData(room, req.user),
-        Messages: messageData(
-          messagesForRoom(room.id, { around: req.params.messageId }),
-          origin(req),
-        ),
-        LoadedAt: epoch(room.updated_at),
-        Stream: rails.signStream(rails.stream(room)),
-        Involvement: membership.involvement,
-        Invitation: false,
-      });
     },
   );
   app.delete("/rooms/:roomId", login, (req, res) => {
@@ -367,7 +381,10 @@ export function registerRoutes(app) {
     deleteRoom(room);
     res.redirect("/");
   });
-  app.get(["/users/me/sidebar", "/users/:id/sidebar"], login, (req, res) => {
+  app.get(["/users/me/sidebar", "/users/:id/sidebar"], login, (req, res) =>
+    sendCachedPage(req, res, "sidebar", () => sidebar(req)),
+  );
+  function sidebar(req) {
     const rooms = roomsForUser(req.user.id).filter(
       (r) => r.involvement !== "invisible",
     );
@@ -380,14 +397,22 @@ export function registerRoutes(app) {
             ? 1
             : (a.name || "").localeCompare(b.name || ""),
     );
-    send(req, res, "sidebar", {
-      SidebarRooms: rooms.map((r) => ({
-        ...roomData(r, req.user),
-        Unread: !!r.unread_at,
-      })),
+    const directs = rooms.filter((r) => r.type === "Rooms::Direct");
+    const directRows = new Map(
+      cachedSidebarDirects(directs, req.user, directMembers).map((html, i) => [
+        directs[i].id,
+        html,
+      ]),
+    );
+    return render(req, "sidebar", {
+      SidebarRooms: rooms.map((r) =>
+        r.type === "Rooms::Direct"
+          ? { Type: r.type, Fragment: directRows.get(r.id) }
+          : { ...roomData(r, req.user), Unread: !!r.unread_at },
+      ),
       Placeholders: [],
     });
-  });
+  }
   app.all(
     [
       "/rooms/:roomId/messages/:id/edit",
@@ -399,6 +424,7 @@ export function registerRoutes(app) {
       "/rooms/:roomId/:botKey/messages",
     ],
     async (req, res) => {
+      if (req.method === "GET") beginPage(req);
       const isBot = !!req.params.botKey,
         user = isBot ? botUser(req) : req.user;
       if (!user)
@@ -427,44 +453,52 @@ export function registerRoutes(app) {
               )?.body || "",
           });
         }
+        if (!json)
+          return message
+            ? sendCachedPage(req, res, "show-message", () =>
+                render(req, "show-message", {
+                  Messages: cachedMessages([message]),
+                }),
+              )
+            : sendCachedPage(req, res, "messages", () => {
+                const rows = messagesForRoom(room.id, req.query);
+                if (!rows.length) return void res.sendStatus(204);
+                const keys = messageCacheKeys(rows);
+                res.set("ETag", messagesEtag(keys));
+                if (req.fresh) return void res.status(304).end();
+                return fragment("messages", {
+                  Messages: cachedMessages(rows, "", keys),
+                });
+              });
         const rows = message ? [message] : messagesForRoom(room.id, req.query);
         if (!rows.length) return res.sendStatus(204);
-        if (json) {
-          if (isBot) {
-            res.set(
-              "X-Total-Count",
-              String(
-                get(
-                  "SELECT count(*) AS n FROM messages WHERE room_id=?",
-                  room.id,
-                ).n,
-              ),
-            );
-            const direction = req.query.after ? "after" : "before",
-              anchor = direction === "after" ? rows.at(-1) : rows[0];
-            if (
-              get(
-                `SELECT id FROM messages WHERE room_id=? AND created_at${direction === "after" ? ">" : "<"}? LIMIT 1`,
-                room.id,
-                anchor.created_at,
-              )
-            )
-              res.set(
-                "Link",
-                `<${origin(req)}/rooms/${room.id}/${req.params.botKey}/messages?${direction}=${anchor.id}>; rel="next"`,
-              );
-          }
-          return res.json(
-            message
-              ? serializeMessage(message, req)
-              : rows.map((m) => serializeMessage(m, req)),
+        if (isBot) {
+          res.set(
+            "X-Total-Count",
+            String(
+              get("SELECT count(*) AS n FROM messages WHERE room_id=?", room.id)
+                .n,
+            ),
           );
+          const direction = req.query.after ? "after" : "before",
+            anchor = direction === "after" ? rows.at(-1) : rows[0];
+          if (
+            get(
+              `SELECT id FROM messages WHERE room_id=? AND created_at${direction === "after" ? ">" : "<"}? LIMIT 1`,
+              room.id,
+              anchor.created_at,
+            )
+          )
+            res.set(
+              "Link",
+              `<${origin(req)}/rooms/${room.id}/${req.params.botKey}/messages?${direction}=${anchor.id}>; rel="next"`,
+            );
         }
-        return message
-          ? send(req, res, "show-message", { Messages: messageData(rows) })
-          : res
-              .type("html")
-              .send(fragment("messages", { Messages: messageData(rows) }));
+        return res.json(
+          message
+            ? serializeMessage(message, req)
+            : rows.map((m) => serializeMessage(m, req)),
+        );
       }
       if (message && !can(user, message)) return res.sendStatus(403);
       const item = attachment(req),
@@ -512,7 +546,7 @@ export function registerRoutes(app) {
           res,
           "append",
           `messages_rooms_${room.type.split("::").pop().toLowerCase()}_${room.id}`,
-          fragment("message", messageData([messageById(message.id)])[0]),
+          String(cachedMessages([messageById(message.id)])[0].Fragment),
         );
       }
       if (["PATCH", "PUT"].includes(req.method)) {
@@ -739,12 +773,14 @@ function registerRoomForms(app) {
           room.id,
         );
         for (const m of current)
-          if (!ids.includes(m.user_id))
+          if (!ids.includes(m.user_id)) {
             run(
               "DELETE FROM memberships WHERE room_id=? AND user_id=?",
               room.id,
               m.user_id,
             );
+            forgetUser(m.user_id);
+          }
         grantMemberships(room, ids);
       });
       room = get("SELECT * FROM rooms WHERE id=?", room.id);
@@ -804,7 +840,7 @@ function registerBoosts(app) {
             time,
           ),
           id = Number(result.lastInsertRowid);
-        run("UPDATE messages SET updated_at=? WHERE id=?", time, message.id);
+        touch("messages", message.id);
         const dto = messageData([message])[0],
           boost = dto.Boosts.find((b) => b.ID === id);
         publish(
@@ -839,7 +875,7 @@ function registerBoosts(app) {
           ),
         );
         run("DELETE FROM boosts WHERE id=?", Number(req.params.id));
-        run("UPDATE messages SET updated_at=? WHERE id=?", now(), message.id);
+        touch("messages", message.id);
         publish(
           rails.stream(room),
           `<turbo-stream action="remove" target="boost_${req.params.id}"></turbo-stream>`,
@@ -870,6 +906,7 @@ function deactivate(user) {
       user.id,
     );
   });
+  forgetUser(user.id);
 }
 function registerUsers(app) {
   app.get("/autocompletable/users", login, (req, res) => {
@@ -911,7 +948,7 @@ function registerUsers(app) {
               Path: "/users/" + u.id,
               Avatar: avatar(u.id, u.updated_at),
             },
-            HTML: newSafe(
+            HTML: safe(
               `<span class="mention" data-user-id="${u.id}">${escape(u.name)}</span>`,
             ),
           }),
@@ -1018,12 +1055,12 @@ function registerUsers(app) {
         run("DELETE FROM sessions WHERE user_id=?", user.id);
         run("UPDATE users SET status=2,updated_at=? WHERE id=?", time, user.id);
       });
+      forgetUser(user.id);
       enqueue("ban-content", { user_id: user.id });
     } else return res.sendStatus(405);
     res.redirect("/users/" + user.id);
   });
 }
-import nunjucks from "nunjucks";
 import sharp from "sharp";
 async function validateUpload(upload) {
   if (
@@ -1036,7 +1073,6 @@ async function validateUpload(upload) {
       throw Object.assign(error, { status: 422 });
     }
 }
-const newSafe = (value) => new nunjucks.runtime.SafeString(value);
 function registerAccount(app) {
   app.all(
     ["/account", "/account/edit", "/account/users"],
@@ -1261,6 +1297,9 @@ function registerSearch(app) {
       }
       return res.redirect("/searches?" + new URLSearchParams({ q: query }));
     }
+    sendCachedPage(req, res, "search", () => search(req, query));
+  });
+  function search(req, query) {
     let rows = [];
     if (query) {
       const ids = all(
@@ -1271,17 +1310,17 @@ function registerSearch(app) {
           .map((word) => '"' + word.replaceAll('"', '""') + '"')
           .join(" "),
       ).map((r) => r.id);
-      rows = ids
-        .map(messageById)
-        .sort((a, b) => a.created_at.localeCompare(b.created_at));
+      rows = messagesByIds(ids).sort((a, b) =>
+        a.created_at.localeCompare(b.created_at),
+      );
     }
-    send(req, res, "search", {
-      Messages: messageData(rows),
+    return render(req, "search", {
+      Messages: cachedMessages(rows),
       Query: query,
       RecentSearches: all(
         "SELECT query FROM searches WHERE user_id=? ORDER BY updated_at DESC LIMIT 10",
         req.user.id,
       ).map((s) => s.query),
     });
-  });
+  }
 }

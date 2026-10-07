@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { DatabaseSync } from "node:sqlite";
+import { openDatabase } from "../src/sqlite.js";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -50,7 +50,7 @@ export function restoreBackup(
     ]);
     const stage = path.join(temp, "storage");
     const database = path.join(stage, "db/production.sqlite3");
-    const db = new DatabaseSync(database, { readOnly: true });
+    const db = openDatabase(database, { readOnly: true });
     try {
       if (
         db.prepare("PRAGMA integrity_check").get().integrity_check !== "ok" ||

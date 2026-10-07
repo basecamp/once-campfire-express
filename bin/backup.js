@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { DatabaseSync, backup } from "node:sqlite";
+import { openDatabase, backupDatabase } from "../src/sqlite.js";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -16,20 +16,20 @@ export async function createBackup(
   const stage = path.join(temp, "storage");
   fs.mkdirSync(path.join(stage, "db"), { recursive: true });
   try {
-    const db = new DatabaseSync(
+    const db = openDatabase(
       process.env.DATABASE_PATH || path.join(storage, "db/production.sqlite3"),
     );
     try {
-      await backup(db, path.join(stage, "db/production.sqlite3"));
+      backupDatabase(db, path.join(stage, "db/production.sqlite3"));
     } finally {
       db.close();
     }
     const jobs =
       process.env.JOBS_DATABASE_PATH || path.join(storage, "db/jobs.sqlite3");
     if (fs.existsSync(jobs)) {
-      const queue = new DatabaseSync(jobs);
+      const queue = openDatabase(jobs);
       try {
-        await backup(queue, path.join(stage, "db/jobs.sqlite3"));
+        backupDatabase(queue, path.join(stage, "db/jobs.sqlite3"));
       } finally {
         queue.close();
       }
