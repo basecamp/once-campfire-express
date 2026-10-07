@@ -184,14 +184,19 @@ export function deliver(stream, message) {
 export function deliverBatch(events) {
   for (const event of events) deliverOne(event.stream, event.message);
 }
+// The publishing worker delivers to its own sockets directly; the primary relays to the others,
+// so a broadcast is serialized and parsed once less. Workers may see concurrent broadcasts in
+// different orders; the client re-sorts appended messages by sort value.
 export function publishMany(events) {
   if (!events.length) return;
-  if (cluster.isWorker) process.send?.({ type: "cable-batch", events });
-  else {
-    deliverBatch(events);
-    for (const worker of Object.values(cluster.workers || {}))
-      worker.send({ type: "cable-batch", events });
-  }
+  deliverBatch(events);
+  if (cluster.isWorker)
+    process.send?.({ type: "cable-batch", events, origin: cluster.worker.id });
+  else relayCable({ type: "cable-batch", events });
+}
+export function relayCable(event, workers = cluster.workers || {}) {
+  for (const worker of Object.values(workers))
+    if (worker.id !== event.origin) worker.send(event);
 }
 export function publish(stream, message) {
   publishMany([{ stream, message }]);

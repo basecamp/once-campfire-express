@@ -2,8 +2,8 @@
 // templates/eta/<macro>.eta, keeping the rendered bytes identical. Kept so the conversion can be
 // reviewed and repeated. nunjucks is no longer a dependency, so to rerun it:
 //   git show <rev>:templates/pages.html > tmp/pages.html
-//   bun add --no-save nunjucks@3.2.4
-//   bun bin/nunjucks-to-eta.js tmp/pages.html templates/eta
+//   npm install --no-save nunjucks@3.2.4
+//   node bin/nunjucks-to-eta.js tmp/pages.html templates/eta
 // It walks the nunjucks AST (nunjucks.parser) and supports only the subset pages.html used;
 // anything else throws instead of being converted approximately.
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";

@@ -173,6 +173,37 @@ test("afterResponse runs work only after the response is finished", async () => 
   }
 });
 
+test("claimMany leases a batch in id order with distinct tokens", () => {
+  reset();
+  const ids = jobs.enqueueMany(
+    Array.from({ length: 5 }, (_, i) => ({
+      kind: "purge",
+      data: { blob_id: i },
+    })),
+  );
+  const first = jobs.claimMany(3);
+  assert.deepEqual(
+    first.map((j) => j.id),
+    ids.slice(0, 3),
+  );
+  assert.equal(new Set(first.map((j) => j.lease_token)).size, 3);
+  for (const job of first) {
+    assert.match(job.lease_token, /^[0-9a-f]{32}$/);
+    assert.equal(job.attempts, 1);
+  }
+  assert.deepEqual(
+    jobs.claimMany(3).map((j) => j.id),
+    ids.slice(3),
+  );
+  assert.deepEqual(jobs.claimMany(3), []);
+  assert.deepEqual(
+    rows()
+      .slice(0, 3)
+      .map((r) => r.lease_token),
+    first.map((j) => j.lease_token),
+  );
+});
+
 test("drainQueue processes every ready job in one pass", async () => {
   reset();
   jobs.enqueueMany(

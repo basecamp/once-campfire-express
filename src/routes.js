@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import bcrypt from "bcryptjs";
-import { all, get, run, transaction, now, touch } from "./db.js";
+import { all, get, run, transaction, now } from "./db.js";
 import {
   roomForUser,
   roomsForUser,
@@ -9,6 +9,8 @@ import {
   messagesByIds,
   directMembers,
   messagesForRoom,
+  PAGE_SIZE,
+  searchMessageIds,
   grantMemberships,
   createUser,
   createMessage,
@@ -24,7 +26,6 @@ import {
   fragment,
   messageData,
   cachedMessages,
-  cachedSidebarDirects,
   messageCacheKeys,
   roomData,
   userData,
@@ -34,7 +35,7 @@ import {
   safe,
 } from "./rendering.js";
 import { escape, plainText, messagePlainText } from "./richtext.js";
-import { beginPage, sendCachedPage } from "./response_cache.js";
+import { beginPage, dependOn, sendCachedPage } from "./response_cache.js";
 import * as rails from "./rails.js";
 import { publish, forgetUser } from "./cable.js";
 import {
@@ -48,6 +49,23 @@ import {
 } from "./storage.js";
 import { enqueue, afterResponse } from "./jobs.js";
 const token = () => randomBytes(18).toString("base64url");
+// Mirrors messagesForRoom(): a new message can change the window only if it sorts at or before
+// `until`, the before= anchor or the newest row of a full upward page. An unanchored window, or an
+// upward page with room left, takes any new message (until null). Ties with an around= pivot are
+// in neither half, so only a full after-half bounds that window.
+function windowTail(room, rows, { before, after, around } = {}) {
+  const full = (counted) =>
+    counted === PAGE_SIZE ? rows.at(-1).created_at : null;
+  if (around) {
+    const pivot = rows.findIndex((m) => m.id === Number(around));
+    return { room, until: pivot < 0 ? null : full(rows.length - pivot - 1) };
+  }
+  const bound = before
+    ? get("SELECT created_at FROM messages WHERE id=?", Number(before))
+        .created_at
+    : null;
+  return { room, until: (after && full(rows.length)) || bound };
+}
 const messagesEtag = (keys) =>
   `W/"${createHash("sha1").update(keys.join("|")).digest("hex")}"`;
 const origin = (req) => `${req.protocol}://${req.get("host")}`;
@@ -356,13 +374,16 @@ export function registerRoutes(app) {
       // Cookies come from these session values on every request, cache hit or not.
       req.lastRoom = room.id;
       req.session.last_room_id = room.id;
-      sendCachedPage(req, res, "room", () =>
-        render(req, "room", {
+      sendCachedPage(req, res, "room", () => {
+        const rows = messagesForRoom(room.id, { around: req.params.messageId });
+        dependOn(req, {
+          room: room.id,
+          messages: rows.map((m) => m.id),
+          tail: windowTail(room.id, rows, { around: req.params.messageId }),
+        });
+        return render(req, "room", {
           Room: roomData(room, req.user),
-          Messages: cachedMessages(
-            messagesForRoom(room.id, { around: req.params.messageId }),
-            origin(req),
-          ),
+          Messages: cachedMessages(rows, origin(req)),
           LoadedAt: epoch(room.updated_at),
           Stream: rails.signStream(rails.stream(room)),
           Involvement: get(
@@ -371,8 +392,8 @@ export function registerRoutes(app) {
             req.user.id,
           ).involvement,
           Invitation: false,
-        }),
-      );
+        });
+      });
     },
   );
   app.delete("/rooms/:roomId", login, (req, res) => {
@@ -385,6 +406,7 @@ export function registerRoutes(app) {
     sendCachedPage(req, res, "sidebar", () => sidebar(req)),
   );
   function sidebar(req) {
+    dependOn(req, { sidebar: true });
     const rooms = roomsForUser(req.user.id).filter(
       (r) => r.involvement !== "invisible",
     );
@@ -397,19 +419,14 @@ export function registerRoutes(app) {
             ? 1
             : (a.name || "").localeCompare(b.name || ""),
     );
-    const directs = rooms.filter((r) => r.type === "Rooms::Direct");
-    const directRows = new Map(
-      cachedSidebarDirects(directs, req.user, directMembers).map((html, i) => [
-        directs[i].id,
-        html,
-      ]),
+    const members = directMembers(
+      rooms.filter((r) => r.type === "Rooms::Direct").map((r) => r.id),
     );
     return render(req, "sidebar", {
-      SidebarRooms: rooms.map((r) =>
-        r.type === "Rooms::Direct"
-          ? { Type: r.type, Fragment: directRows.get(r.id) }
-          : { ...roomData(r, req.user), Unread: !!r.unread_at },
-      ),
+      SidebarRooms: rooms.map((r) => ({
+        ...roomData(r, req.user, members.get(r.id)),
+        Unread: !!r.unread_at,
+      })),
       Placeholders: [],
     });
   }
@@ -455,14 +472,24 @@ export function registerRoutes(app) {
         }
         if (!json)
           return message
-            ? sendCachedPage(req, res, "show-message", () =>
-                render(req, "show-message", {
+            ? sendCachedPage(req, res, "show-message", () => {
+                dependOn(req, { messages: [message.id] });
+                return render(req, "show-message", {
                   Messages: cachedMessages([message]),
-                }),
-              )
+                });
+              })
             : sendCachedPage(req, res, "messages", () => {
                 const rows = messagesForRoom(room.id, req.query);
                 if (!rows.length) return void res.sendStatus(204);
+                const { before, after, around } = req.query;
+                dependOn(req, {
+                  // Paging anchors are not shown but must still exist.
+                  messages: [
+                    ...rows.map((m) => m.id),
+                    ...[before, after].filter(Boolean).map(Number),
+                  ],
+                  tail: windowTail(room.id, rows, req.query),
+                });
                 const keys = messageCacheKeys(rows);
                 res.set("ETag", messagesEtag(keys));
                 if (req.fresh) return void res.status(304).end();
@@ -528,7 +555,7 @@ export function registerRoutes(app) {
           cleanupPrepared(blob);
           throw error;
         }
-        publishMessage(message);
+        const html = publishMessage(message);
         afterResponse(res, () => notifyMessage(message));
         if (isBot)
           return res
@@ -546,7 +573,7 @@ export function registerRoutes(app) {
           res,
           "append",
           `messages_rooms_${room.type.split("::").pop().toLowerCase()}_${room.id}`,
-          String(cachedMessages([messageById(message.id)])[0].Fragment),
+          html ?? String(cachedMessages([messageById(message.id)])[0].Fragment),
         );
       }
       if (["PATCH", "PUT"].includes(req.method)) {
@@ -840,7 +867,7 @@ function registerBoosts(app) {
             time,
           ),
           id = Number(result.lastInsertRowid);
-        touch("messages", message.id);
+        run("UPDATE messages SET updated_at=? WHERE id=?", time, message.id);
         const dto = messageData([message])[0],
           boost = dto.Boosts.find((b) => b.ID === id);
         publish(
@@ -875,7 +902,7 @@ function registerBoosts(app) {
           ),
         );
         run("DELETE FROM boosts WHERE id=?", Number(req.params.id));
-        touch("messages", message.id);
+        run("UPDATE messages SET updated_at=? WHERE id=?", now(), message.id);
         publish(
           rails.stream(room),
           `<turbo-stream action="remove" target="boost_${req.params.id}"></turbo-stream>`,
@@ -1300,20 +1327,14 @@ function registerSearch(app) {
     sendCachedPage(req, res, "search", () => search(req, query));
   });
   function search(req, query) {
-    let rows = [];
-    if (query) {
-      const ids = all(
-        "SELECT m.id FROM messages m JOIN message_search_index idx ON idx.rowid=m.id JOIN memberships ms ON ms.room_id=m.room_id WHERE ms.user_id=? AND idx.body MATCH ? ORDER BY m.created_at DESC LIMIT 100",
-        req.user.id,
-        query
-          .split(/\s+/)
-          .map((word) => '"' + word.replaceAll('"', '""') + '"')
-          .join(" "),
-      ).map((r) => r.id);
-      rows = messagesByIds(ids).sort((a, b) =>
-        a.created_at.localeCompare(b.created_at),
-      );
-    }
+    const found = searchMessageIds(req.user.id, query);
+    const rows = messagesByIds(found).sort((a, b) =>
+      a.created_at.localeCompare(b.created_at),
+    );
+    dependOn(req, {
+      search: { query, found },
+      messages: rows.map((m) => m.id),
+    });
     return render(req, "search", {
       Messages: cachedMessages(rows),
       Query: query,

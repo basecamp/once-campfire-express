@@ -10,7 +10,7 @@ include BenchmarkSupport
 repo = File.expand_path("..", __dir__)
 workspace = File.dirname(repo)
 work = File.join(repo, "tmp/bench")
-options = { apps: "express,express-bun,rust", rounds: 2, duration: 4, concurrencies: "16", port: 25130,
+options = { apps: "express,rust", rounds: 2, duration: 4, concurrencies: "16", port: 25130,
   seed: File.join(workspace, "once-campfire-rust/parity/.seed/default"), preflight: false,
   loadgen: ENV.fetch("LOADGEN", File.join(workspace, "once-campfire-rust/bench/loadgen/target/release/loadgen")),
   env_file: ENV.fetch("BENCH_ENV_FILE", File.join(workspace, "once-campfire-rust/parity/.env.reference")),
@@ -28,9 +28,8 @@ OptionParser.new do |parser|
 end.parse!
 raise "use an even number of rounds" unless options[:rounds].positive? && options[:rounds].even?
 apps = options[:apps].split(",")
-raise "unknown app" unless (apps - %w[express express-bun rust]).empty?
-# express-bun is the same Express source built from Dockerfile.bun; only the runtime differs.
-runtimes = { "express" => "node", "express-bun" => "bun", "rust" => "rust" }
+raise "unknown app" unless (apps - %w[express rust]).empty?
+runtimes = { "express" => "node", "rust" => "rust" }
 env_name = ->(app) { app.upcase.tr("-", "_") }
 labels = JSON.parse(File.read(File.join(options[:seed], "labels.json")))
 original_seed_sha = Digest::SHA256.file(File.join(options[:seed], "db/production.sqlite3")).hexdigest
@@ -67,7 +66,7 @@ begin
   options[:rounds].times do |iteration|
     order = iteration.even? ? apps : apps.reverse
     order.each do |app|
-      image = ENV.fetch("#{env_name.(app)}_IMAGE", { "rust" => "campfire-rust:app", "express-bun" => "once-campfire-express:bun" }.fetch(app, "once-campfire-#{app}:app"))
+      image = ENV.fetch("#{env_name.(app)}_IMAGE", { "rust" => "campfire-rust:app" }.fetch(app, "once-campfire-#{app}:app"))
       source = File.join(workspace, app == "rust" ? "once-campfire-rust" : "once-campfire-express")
       metadata[:images][app] = run("docker", "image", "inspect", "-f", "{{.Id}}", image).strip
       metadata[:image_labels][app] = JSON.parse(run("docker", "image", "inspect", "-f", "{{json .Config.Labels}}", image))

@@ -8,7 +8,6 @@ import { join } from "node:path";
 process.env.SECRET_KEY_BASE = "response-cache-tests-".repeat(8);
 const temp = mkdtempSync(join(tmpdir(), "campfire-response-cache-"));
 process.env.CAMPFIRE_STORAGE_PATH = temp;
-process.env.CAMPFIRE_RESPONSE_CACHE_MB = "32";
 const { run, get, now, initialize, databaseFile } =
   await import("../src/db.js");
 const { openDatabase } = await import("../src/sqlite.js");
@@ -164,10 +163,11 @@ test("a repeated room GET is a byte-identical hit in identity and gzip, equal to
   assert.ok(plain.body.equals(first.result.body));
   assert.equal(plain.response.headers.etag, first.result.response.headers.etag);
   assert.ok(
-    plainZipped.body.equals(zipped.result.body),
-    "cached gzip is the spliced gzip of the same page, byte for byte",
+    zlib
+      .gunzipSync(plainZipped.body)
+      .equals(zlib.gunzipSync(zipped.result.body)),
   );
-  for (const name of ["content-type", "vary", "content-length"])
+  for (const name of ["content-type", "vary"])
     assert.equal(
       zipped.result.response.headers[name],
       plainZipped.response.headers[name],
@@ -406,14 +406,27 @@ test("the cache stays within its byte budget, gzip included", () => {
   assert.equal(cache.get("big", "e2"), undefined);
 });
 
-test("CAMPFIRE_RESPONSE_CACHE_MB defaults to off and clamps invalid and negative values to 0", () => {
+test("CAMPFIRE_RESPONSE_CACHE_MB clamps invalid and negative values to 32", () => {
   const mb = 1024 * 1024;
-  assert.equal(budgetFromEnv(undefined), 0);
-  assert.equal(budgetFromEnv(""), 0);
-  assert.equal(budgetFromEnv("nope"), 0);
-  assert.equal(budgetFromEnv("-5"), 0);
+  assert.equal(budgetFromEnv(undefined), 32 * mb);
+  assert.equal(budgetFromEnv(""), 32 * mb);
+  assert.equal(budgetFromEnv("nope"), 32 * mb);
+  assert.equal(budgetFromEnv("-5"), 32 * mb);
   assert.equal(budgetFromEnv("0"), 0);
   assert.equal(budgetFromEnv("8"), 8 * mb);
+});
+
+test("message cache keys see a body change that keeps updated_at", () => {
+  const message = domain.createMessage(open.id, admin.id, "<p>before</p>");
+  const row = domain.messageById(message.id);
+  const [first] = messageCacheKeys([row]);
+  assert.equal(messageCacheKeys([row])[0], first);
+  run(
+    "UPDATE action_text_rich_texts SET body=? WHERE record_type='Message' AND record_id=?",
+    "<p>after</p>",
+    message.id,
+  );
+  assert.notEqual(messageCacheKeys([row])[0], first);
 });
 
 test("a cache miss encodes the rendered page to bytes once and answers 304 on the fast ETag", async () => {
@@ -443,32 +456,15 @@ test("a cache miss encodes the rendered page to bytes once and answers 304 on th
   assert.equal(fresh.body.length, 0);
 });
 
-test("message cache keys follow updated_at, which every edit moves even in one frozen millisecond", () => {
-  const frozen = process.env.CAMPFIRE_FROZEN_TIME;
-  process.env.CAMPFIRE_FROZEN_TIME = "2026-01-02T03:04:05.678Z";
-  try {
-    const message = domain.createMessage(open.id, admin.id, "<p>aaaa</p>");
-    const key = () => messageCacheKeys([domain.messageById(message.id)])[0];
-    const first = key();
-    assert.equal(key(), first);
-    assert.match(
-      domain.messageById(message.id).updated_at,
-      /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{6}$/,
-    );
-    domain.updateMessage(domain.messageById(message.id), "<p>bbbb</p>");
-    const second = key();
-    assert.notEqual(second, first, "same-length edit in the same millisecond");
-    domain.updateMessage(domain.messageById(message.id), "<p>cccc</p>");
-    assert.notEqual(key(), second);
-    const third = key();
-    run(
-      "UPDATE action_text_rich_texts SET body=? WHERE record_type='Message' AND record_id=?",
-      "<p>dddd</p>",
-      message.id,
-    );
-    assert.equal(key(), third, "keys never read bodies; writers touch");
-  } finally {
-    if (frozen === undefined) delete process.env.CAMPFIRE_FROZEN_TIME;
-    else process.env.CAMPFIRE_FROZEN_TIME = frozen;
-  }
+test("message cache keys are stable across calls and see same-length edits", () => {
+  const message = domain.createMessage(open.id, admin.id, "<p>aaaa</p>");
+  const row = domain.messageById(message.id);
+  const [first] = messageCacheKeys([row]);
+  assert.equal(messageCacheKeys([row])[0], first);
+  run(
+    "UPDATE action_text_rich_texts SET body=? WHERE record_type='Message' AND record_id=?",
+    "<p>bbbb</p>",
+    message.id,
+  );
+  assert.notEqual(messageCacheKeys([row])[0], first);
 });

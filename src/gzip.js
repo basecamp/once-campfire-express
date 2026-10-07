@@ -11,6 +11,7 @@ const WINDOW = 32 * 1024;
 const HEADER = Buffer.from([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]);
 const FINAL_BLOCK = Buffer.from([0x03, 0x00]);
 const OVERHEAD = 128;
+const MIN_SEGMENT = 1024;
 
 // A sync flush ends each piece on a byte boundary without a final block, so pieces can be
 // concatenated into one deflate stream.
@@ -118,10 +119,6 @@ function split(bytes, needles) {
   }
 }
 
-const pieceHash = globalThis.Bun
-  ? (bytes, seed) => Bun.hash(bytes, seed)
-  : (bytes, seed) => zlib.crc32(bytes, Number(seed & 0xffffffffn));
-
 export class SplicedGzip {
   #entries = new Map();
   #texts = new Map();
@@ -129,17 +126,17 @@ export class SplicedGzip {
   #bytes = 0;
   #hits = 0;
   #misses = 0;
-  #seed = randomBytes(8).readBigUInt64LE();
+  #seed = randomBytes(4).readUInt32LE();
 
   constructor(budget) {
     this.budget = budget;
     this.maxEntry = Math.floor(budget / 8);
   }
 
-  // Only picks candidates; #find confirms with Buffer.equals, so a crc32 collision on Node
+  // Only picks candidates; #find confirms with Buffer.equals, so a crc32 collision
   // costs a comparison, never a wrong piece.
   hash(bytes) {
-    return pieceHash(bytes, this.#seed);
+    return zlib.crc32(bytes, this.#seed);
   }
 
   stats() {
@@ -158,6 +155,28 @@ export class SplicedGzip {
       (v) => Buffer.from(v, "utf8"),
     );
     const { segments, volatiles } = split(bytes, needles);
+    return this.#encode(bytes, segments, needles, volatiles);
+  }
+
+  // A page assembled from chunks (template text around stored message fragments) is split at
+  // chunk boundaries, so an unchanged fragment reuses its deflated piece when neighbouring
+  // messages arrive or scroll out. Short chunks join the next one to keep pieces few.
+  gzipChunks(chunks, bytes = Buffer.concat(chunks)) {
+    const segments = [];
+    let start = 0;
+    let end = 0;
+    for (const chunk of chunks) {
+      end += chunk.length;
+      if (end - start >= MIN_SEGMENT) {
+        segments.push({ start, end, after: 0 });
+        start = end;
+      }
+    }
+    if (end > start) segments.push({ start, end, after: 0 });
+    return this.#encode(bytes, segments, [], []);
+  }
+
+  #encode(bytes, segments, needles, volatiles) {
     for (const segment of segments) {
       segment.bytes = bytes.subarray(segment.start, segment.end);
       segment.hash = `${this.hash(segment.bytes)}:${segment.bytes.length}`;
@@ -331,26 +350,9 @@ function withUtf8Charset(type) {
 
 const noTransform = /(?:^|,)\s*?no-transform\s*?(?:,|$)/i;
 
-// The bytes SplicedGzip produces for a page with no volatile values (one piece, no window),
-// without keeping that piece in its cache: the response cache keeps the whole result instead.
-export function gzipWhole(bytes) {
-  const trailer = Buffer.alloc(8);
-  trailer.writeUInt32LE(zlib.crc32(bytes) >>> 0, 0);
-  trailer.writeUInt32LE(bytes.length >>> 0, 4);
-  return Buffer.concat([
-    HEADER,
-    deflate(bytes, Buffer.alloc(0)),
-    FINAL_BLOCK,
-    trailer,
-  ]);
-}
-
 export const htmlType = withUtf8Charset("text/html; charset=utf-8");
 
-const bodyHash =
-  typeof Bun !== "undefined" && typeof Bun.hash === "function"
-    ? (bytes) => Bun.hash(bytes).toString(16)
-    : (bytes) => zlib.crc32(bytes).toString(16);
+const bodyHash = (bytes) => zlib.crc32(bytes).toString(16);
 
 // Weak validator for pages we render ourselves. Only has to be stable per body, so a fast
 // non-cryptographic hash replaces Express's SHA-1; the length makes collisions far less likely.

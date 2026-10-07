@@ -6,7 +6,7 @@ import { execFile } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import express from "express";
 import sharp from "sharp";
-import { all, get, run, transaction, now, touch } from "./db.js";
+import { all, get, run, transaction, now } from "./db.js";
 import * as rails from "./rails.js";
 
 const execute = promisify(execFile);
@@ -85,7 +85,6 @@ export function storeUpload(upload, recordType, recordId, name) {
         id,
         now(),
       );
-      touchRecord(recordType, recordId);
       return get("SELECT * FROM active_storage_blobs WHERE id=?", id);
     }),
   );
@@ -108,12 +107,7 @@ export function attachSigned(token, recordType, recordId, name, userId = null) {
     id,
     now(),
   );
-  touchRecord(recordType, recordId);
   return blob;
-}
-// Like Rails' `belongs_to :record, touch: true`: rendered messages are cached by updated_at.
-function touchRecord(recordType, recordId) {
-  if (recordType === "Message") touch("messages", recordId);
 }
 export function removeAttachment(recordType, recordId, name) {
   const ids = all(
@@ -128,7 +122,6 @@ export function removeAttachment(recordType, recordId, name) {
     recordId,
     name,
   );
-  if (ids.length) touchRecord(recordType, recordId);
   return ids;
 }
 export function replaceAttachment(upload, recordType, recordId, name) {
@@ -226,7 +219,27 @@ export function servingAttributes(type, disposition = "inline") {
 }
 export function serve(req, res, file, type, filename, disposition = "inline") {
   if (!fs.existsSync(file)) return res.sendStatus(404);
-  const size = fs.statSync(file).size;
+  const range = servedRange(
+    req,
+    res,
+    fs.statSync(file).size,
+    type,
+    filename,
+    disposition,
+  );
+  if (!range) return;
+  const stream = fs.createReadStream(file, range);
+  stream.on("error", (error) => res.destroy(error));
+  res.on("close", () => stream.destroy());
+  stream.pipe(res);
+}
+export function serveBytes(req, res, bytes, type, filename) {
+  const range = servedRange(req, res, bytes.length, type, filename, "inline");
+  if (range) res.end(bytes.subarray(range.start, range.end + 1));
+}
+// Sets the shared headers and answers HEAD, empty and unsatisfiable requests; otherwise returns
+// the inclusive byte range left to send.
+function servedRange(req, res, size, type, filename, disposition) {
   res.set({
     "Accept-Ranges": "bytes",
     "Content-Type": type,
@@ -237,7 +250,7 @@ export function serve(req, res, file, type, filename, disposition = "inline") {
   if (req.headers.range) {
     const m = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range);
     if (!m || (!m[1] && !m[2]))
-      return res.status(416).set("Content-Range", `bytes */${size}`).end();
+      return void res.status(416).set("Content-Range", `bytes */${size}`).end();
     start = m[1] ? Number(m[1]) : Math.max(0, size - Number(m[2]));
     end = m[1] && m[2] ? Math.min(size - 1, Number(m[2])) : size - 1;
     if (
@@ -246,15 +259,12 @@ export function serve(req, res, file, type, filename, disposition = "inline") {
       start > end ||
       start >= size
     )
-      return res.status(416).set("Content-Range", `bytes */${size}`).end();
+      return void res.status(416).set("Content-Range", `bytes */${size}`).end();
     res.status(206).set("Content-Range", `bytes ${start}-${end}/${size}`);
   }
   res.set("Content-Length", String(Math.max(0, end - start + 1)));
-  if (req.method === "HEAD" || size === 0) return res.end();
-  const stream = fs.createReadStream(file, { start, end });
-  stream.on("error", (error) => res.destroy(error));
-  res.on("close", () => stream.destroy());
-  stream.pipe(res);
+  if (req.method === "HEAD" || size === 0) return void res.end();
+  return { start, end };
 }
 export function authorizedBlob(blob, user) {
   if (!user) return false;

@@ -1,7 +1,6 @@
 # Benchmarks
 
-Ruby orchestrates fresh production containers of Express on Node (`express`), the same
-Express code on Bun 1.4.2 (`express-bun`) and the
+Ruby orchestrates fresh production containers of Express on Node 24 (`express`) and the
 [Rust port](https://github.com/basecamp/once-campfire-rust), alternating their order.
 Both the seed and the load generator come from a sibling `once-campfire-rust` checkout,
 and this repository is expected at the sibling path `once-campfire-express`:
@@ -18,16 +17,15 @@ Then, from this repository with the `reference` submodule checked out:
 
 ```sh
 npm run bench:image       # rebuild once-campfire-express:app (Node) after every change
-npm run bench:image:bun   # rebuild once-campfire-express:bun from Dockerfile.bun
 npm run bench             # bench:reads, bench:writes and bench:cable in turn
 ```
 
 Each suite writes `summary.json` and per-round JSON to `tmp/bench/results/{reads,writes,cable}/`.
-`--apps` picks a subset (default `express,express-bun,rust`). `LOADGEN`, `BENCH_ENV_FILE`,
-`RUST_IMAGE`, `EXPRESS_IMAGE` and `EXPRESS_BUN_IMAGE` override the defaults
+`--apps` picks a subset (default `express,rust`). `LOADGEN`, `BENCH_ENV_FILE`,
+`RUST_IMAGE` and `EXPRESS_IMAGE` override the defaults
 (`bench/loadgen/target/release/loadgen`, `parity/.env.reference`, `campfire-rust:app`,
-`once-campfire-express:app`, `once-campfire-express:bun`); `<APP>_BENCH_ENV` (JSON) adds
-environment, e.g. `EXPRESS_BUN_BENCH_ENV='{"WEB_WORKERS":"3"}'`. Each run's metadata records
+`once-campfire-express:app`); `<APP>_BENCH_ENV` (JSON) adds
+environment, e.g. `EXPRESS_BENCH_ENV='{"WEB_WORKERS":"3"}'`. Each run's metadata records
 the runtime per app. For other options, run `ruby bench/compare.rb --help`.
 
 Server processes share four hardware threads (`--cpus`); clients use separate threads

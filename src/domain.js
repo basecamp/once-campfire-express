@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import bcrypt from "bcryptjs";
-import { all, get, run, transaction, now, onCommit, touch } from "./db.js";
+import { all, get, run, transaction, now, onCommit } from "./db.js";
 import {
   sanitize,
   plainText,
@@ -15,7 +15,7 @@ export const userById = (id) =>
   get("SELECT * FROM users WHERE id=?", Number(id));
 export const roomsForUser = (id) =>
   all(
-    "SELECT r.*,m.involvement,m.unread_at,m.id AS membership_id,m.updated_at AS membership_updated_at FROM rooms r JOIN memberships m ON m.room_id=r.id WHERE m.user_id=? ORDER BY lower(r.name)",
+    "SELECT r.*,m.involvement,m.unread_at FROM rooms r JOIN memberships m ON m.room_id=r.id WHERE m.user_id=? ORDER BY lower(r.name)",
     Number(id),
   );
 export const roomForUser = (user, id) =>
@@ -32,8 +32,9 @@ export const presentation = `SELECT ${presentationColumns} FROM messages m ${pre
 // Pages the messages first and joins the 40 survivors. Equivalent to joining first because
 // messages.creator_id and room_id are NOT NULL foreign keys (foreign_keys=ON), so the inner
 // joins never drop a row.
+export const PAGE_SIZE = 40;
 export const pagedPresentation = (clauses, direction) =>
-  `SELECT ${presentationColumns} FROM (SELECT * FROM messages WHERE ${clauses} ORDER BY created_at ${direction}, id ${direction} LIMIT 40) m ${presentationJoins} ORDER BY m.created_at ${direction}, m.id ${direction}`;
+  `SELECT ${presentationColumns} FROM (SELECT * FROM messages WHERE ${clauses} ORDER BY created_at ${direction}, id ${direction} LIMIT ${PAGE_SIZE}) m ${presentationJoins} ORDER BY m.created_at ${direction}, m.id ${direction}`;
 export const messageById = (id) =>
   get(presentation + " WHERE m.id=?", Number(id));
 export function messagesByIds(ids) {
@@ -67,14 +68,14 @@ export function messagesForRoom(id, { before, after, around } = {}) {
     return [
       ...all(
         presentation +
-          " WHERE m.room_id=? AND m.created_at<? ORDER BY m.created_at DESC LIMIT 40",
+          ` WHERE m.room_id=? AND m.created_at<? ORDER BY m.created_at DESC LIMIT ${PAGE_SIZE}`,
         Number(id),
         pivot.created_at,
       ).reverse(),
       messageById(pivot.id),
       ...all(
         presentation +
-          " WHERE m.room_id=? AND m.created_at>? ORDER BY m.created_at ASC LIMIT 40",
+          ` WHERE m.room_id=? AND m.created_at>? ORDER BY m.created_at ASC LIMIT ${PAGE_SIZE}`,
         Number(id),
         pivot.created_at,
       ),
@@ -99,6 +100,17 @@ export function messagesForRoom(id, { before, after, around } = {}) {
     }
   const rows = all(pagedPresentation(clauses, after ? "ASC" : "DESC"), ...args);
   return after ? rows : rows.reverse();
+}
+export function searchMessageIds(userId, query) {
+  if (!query) return [];
+  return all(
+    "SELECT m.id FROM messages m JOIN message_search_index idx ON idx.rowid=m.id JOIN memberships ms ON ms.room_id=m.room_id WHERE ms.user_id=? AND idx.body MATCH ? ORDER BY m.created_at DESC LIMIT 100",
+    Number(userId),
+    query
+      .split(/\s+/)
+      .map((word) => '"' + word.replaceAll('"', '""') + '"')
+      .join(" "),
+  ).map((r) => r.id);
 }
 export function grantMemberships(room, userIds) {
   const timestamp = now();
@@ -172,22 +184,20 @@ export function createMessage(roomId, userId, body = "", clientId = null) {
       time,
     );
     const id = Number(result.lastInsertRowid);
-    run(
+    const richText = run(
       "INSERT INTO action_text_rich_texts(name,record_type,record_id,body,created_at,updated_at) VALUES('body','Message',?,?,?,?)",
       id,
       content,
       time,
       time,
     );
-    reconcileEmbeds(
-      get(
-        "SELECT id FROM action_text_rich_texts WHERE record_type='Message' AND record_id=?",
-        id,
-      ).id,
-      content,
-      Number(userId),
+    reconcileEmbeds(Number(richText.lastInsertRowid), content, Number(userId));
+    // AUTOINCREMENT ids are never reused, so there is no stale index row to delete (Rails' create_in_index).
+    run(
+      "INSERT INTO message_search_index(rowid,body) VALUES(?,?)",
+      id,
+      plainText(content),
     );
-    indexMessage(id, content);
     run("UPDATE rooms SET updated_at=? WHERE id=?", time, Number(roomId));
     const cutoff = new Date(Date.now() - 60000)
       .toISOString()
@@ -237,7 +247,7 @@ export function updateMessage(
       );
       indexMessage(message.id, content, attachment?.filename || "");
     }
-    touch("messages", message.id);
+    run("UPDATE messages SET updated_at=? WHERE id=?", time, message.id);
     run("UPDATE rooms SET updated_at=? WHERE id=?", time, message.room_id);
   });
   return messageById(message.id);
@@ -284,6 +294,7 @@ export function deleteMessage(message, { broadcast = true } = {}) {
     if (broadcast) publishMessage(message, "remove");
   });
 }
+// Returns the broadcast fragment so the poster's own response reuses it instead of rendering twice.
 export function publishMessage(message, action = "append") {
   const room = get("SELECT * FROM rooms WHERE id=?", message.room_id);
   if (!room) return;
@@ -311,6 +322,7 @@ export function publishMessage(message, action = "append") {
         message: { roomId: room.id },
       });
   publishMany(events);
+  return html;
 }
 export function notifyMessage(message, { webhooks = true } = {}) {
   const body =
