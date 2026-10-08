@@ -221,22 +221,20 @@ export function createMessage(roomId, userId, body = "", clientId = null) {
       time,
     );
     const id = Number(result.lastInsertRowid);
-    run(
+    const richText = run(
       "INSERT INTO action_text_rich_texts(name,record_type,record_id,body,created_at,updated_at) VALUES('body','Message',?,?,?,?)",
       id,
       content,
       time,
       time,
     );
-    reconcileEmbeds(
-      get(
-        "SELECT id FROM action_text_rich_texts WHERE record_type='Message' AND record_id=?",
-        id,
-      ).id,
-      content,
-      Number(userId),
+    reconcileEmbeds(Number(richText.lastInsertRowid), content, Number(userId));
+    // A new AUTOINCREMENT message cannot have an existing search-index row.
+    run(
+      "INSERT INTO message_search_index(rowid,body) VALUES(?,?)",
+      id,
+      plainText(content),
     );
-    indexMessage(id, content);
     run("UPDATE rooms SET updated_at=? WHERE id=?", time, Number(roomId));
     const cutoff = new Date(Date.now() - 60000)
       .toISOString()
@@ -360,6 +358,7 @@ export function publishMessage(message, action = "append") {
         message: { roomId: room.id },
       });
   publishMany(events);
+  return html;
 }
 export function notifyMessage(message, { webhooks = true } = {}) {
   const body =

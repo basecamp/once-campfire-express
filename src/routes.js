@@ -525,7 +525,7 @@ export function registerRoutes(app) {
           cleanupPrepared(blob);
           throw error;
         }
-        publishMessage(message);
+        const html = publishMessage(message);
         notifyMessage(message);
         if (isBot)
           return res
@@ -543,7 +543,7 @@ export function registerRoutes(app) {
           res,
           "append",
           `messages_rooms_${room.type.split("::").pop().toLowerCase()}_${room.id}`,
-          String(cachedMessages([messageById(message.id)])[0].Fragment),
+          html ?? String(cachedMessages([messageById(message.id)])[0].Fragment),
         );
       }
       if (["PATCH", "PUT"].includes(req.method)) {
