@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { db, now, writeEpoch } from "./db.js";
-import { searchMessageIds } from "./domain.js";
+import { db, writeEpoch } from "./db.js";
+import { messageWindowIds, searchMessageIds } from "./domain.js";
 import { fastEtag, htmlType, sendPage, splicedGzipCache } from "./gzip.js";
-import { epoch as timeOf, renderChunks } from "./rendering.js";
+import { messageCacheKeys, renderChunks } from "./rendering.js";
 
 const OVERHEAD = 256;
 
@@ -155,8 +155,8 @@ export const responseCache = new ResponseCache(
   budgetFromEnv(process.env.CAMPFIRE_RESPONSE_CACHE_MB),
 );
 
-// Validator queries read exactly what the cached pages print (see dependOn() call sites).
-// Message bodies are the one input represented by timestamps instead of content; see SETTLE_MS.
+// Validator queries read exactly what the cached pages print (see dependOn() call sites). Shown
+// messages are compared by their fragment keys, which digest every value a fragment prints.
 const VALIDATOR_SQL = {
   logo: "SELECT EXISTS(SELECT 1 FROM active_storage_attachments WHERE record_type='Account' AND record_id=? AND name='logo') AS value",
   room: "SELECT json_array(r.id,r.name,r.type,r.creator_id,r.updated_at,m.involvement,CASE WHEN r.type='Rooms::Direct' THEN (SELECT json_group_array(json_array(u.id,u.name)) FROM memberships d JOIN users u ON u.id=d.user_id WHERE d.room_id=r.id) END) AS value FROM rooms r LEFT JOIN memberships m ON m.room_id=r.id AND m.user_id=?1 WHERE r.id=?2",
@@ -165,8 +165,7 @@ const VALIDATOR_SQL = {
   searches:
     "SELECT json_group_array(json_array(id,query,updated_at)) AS value FROM (SELECT id,query,updated_at FROM searches WHERE user_id=? ORDER BY updated_at DESC LIMIT 10)",
   messages:
-    "SELECT json_group_array(json_array(m.id,m.room_id,m.creator_id,m.client_message_id,m.created_at,m.updated_at,u.name,u.updated_at,r.name,t.id,t.updated_at,length(t.body),substr(t.body,1,32)||substr(t.body,-32),a.blob_id)) AS value, max(t.updated_at) AS newest, (SELECT json_group_array(json_array(b.id,b.message_id,b.booster_id,b.content,b.updated_at,bu.name,bu.updated_at)) FROM json_each(?1) k JOIN boosts b ON b.message_id=k.value JOIN users bu ON bu.id=b.booster_id) AS boosts FROM json_each(?1) j JOIN messages m ON m.id=j.value JOIN users u ON u.id=m.creator_id JOIN rooms r ON r.id=m.room_id LEFT JOIN action_text_rich_texts t ON t.record_type='Message' AND t.record_id=m.id AND t.name='body' LEFT JOIN active_storage_attachments a ON a.record_type='Message' AND a.record_id=m.id AND a.name='attachment'",
-  tail: "SELECT (SELECT id FROM messages WHERE room_id=?1 ORDER BY id DESC LIMIT 1) AS top, EXISTS(SELECT 1 FROM messages WHERE room_id=?1 AND id>?2 AND (?3 IS NULL OR created_at<=?3)) AS entered",
+    "SELECT m.id,m.room_id,m.creator_id,m.client_message_id,m.created_at,m.updated_at,u.name AS creator_name,u.updated_at AS creator_updated_at,r.name AS room_name FROM json_each(?1) j JOIN messages m ON m.id=j.value JOIN users u ON u.id=m.creator_id JOIN rooms r ON r.id=m.room_id ORDER BY j.key",
 };
 
 const connections = new WeakMap();
@@ -260,20 +259,23 @@ function middlewareRowsCurrent(req) {
   );
 }
 
-// A message body is validated by its rich text updated_at (plus length and edges), which a later
-// edit could repeat within the same millisecond, or always under CAMPFIRE_FROZEN_TIME. Edits take
-// that timestamp inside their write transaction, so one committed after a render is newer than the
-// render time minus the transaction's duration. Pages showing a body written (posted or edited)
-// less than SETTLE_MS before the render (far longer than any write transaction) are cached for their epoch only.
-// This assumes the system clock does not step backwards by more than that.
-const SETTLE_MS = 15_000;
-
 // Records what the page being rendered shows, for revalidating it in a later epoch:
 // room: id (room row, viewer's involvement, direct members); sidebar: true (the viewer's rooms);
 // search: { query, found } (searched again, plus recent searches); messages: shown or anchoring
-// message ids; tail: { room, until } (see windowTail() in routes.js).
+// message ids; window: { room, before, after, around } (the messagesForRoom() arguments, whose
+// selection is run again so any message moved into or out of the window is seen).
 export function dependOn(req, deps) {
   if (req.pageDeps) Object.assign(req.pageDeps, deps);
+}
+
+// null once a before=/after= anchor has left the room, where the page is a 404.
+function windowIds({ room, ...window }) {
+  try {
+    return messageWindowIds(room, window);
+  } catch (error) {
+    if (error.status === 404) return null;
+    throw error;
+  }
 }
 
 // The viewer and account rows render() prints are part of every validator, so they must be the
@@ -289,7 +291,6 @@ function pageValidator(req, deps, rendering = false) {
     state.logo.get(req.account?.id ?? 0).value,
   ];
   const userId = req.user?.id ?? 0;
-  let newest = null;
   if (deps.room) parts.push(state.room.get(userId, deps.room)?.value);
   if (deps.sidebar) parts.push(state.sidebar.get(userId).value);
   if (deps.search)
@@ -301,36 +302,20 @@ function pageValidator(req, deps, rendering = false) {
       ),
       state.searches.get(userId).value,
     );
-  if (deps.messages?.length) {
-    const row = state.messages.get(JSON.stringify(deps.messages));
-    parts.push(row.value, row.boosts);
-    newest = row.newest || null;
-  }
+  if (deps.window) parts.push(JSON.stringify(windowIds(deps.window)));
+  if (deps.messages?.length)
+    parts.push(
+      ...messageCacheKeys(state.messages.all(JSON.stringify(deps.messages))),
+    );
   // Hashed so entries hold neither the rows (password digests included) nor their size.
-  const value = createHash("sha1").update(parts.join("\n")).digest("base64");
-  return { value, newest };
+  return createHash("sha1").update(parts.join("\n")).digest("base64");
 }
-
-const settled = (newest) =>
-  newest === null || timeOf(newest) < timeOf(now()) - SETTLE_MS;
-
-// Messages ids are AUTOINCREMENT, so every message added after the render has an id above since.
-const settleTail = ({ room, until }) => ({
-  room,
-  until,
-  since: connectionState(db()).tail.get(room, 0, null).top ?? 0,
-});
 
 function revalidates(req, page, epoch) {
   if (!page.validator || !middlewareRowsCurrent(req)) return false;
-  const { value } = pageValidator(req, page.deps);
-  const { tail } = page.deps;
-  const grown =
-    tail && connectionState(db()).tail.get(tail.room, tail.since, tail.until);
-  if (value !== page.validator || grown?.entered || pageEpoch() !== epoch)
-    return false;
-  if (grown?.top) tail.since = grown.top;
-  return true;
+  return (
+    pageValidator(req, page.deps) === page.validator && pageEpoch() === epoch
+  );
 }
 
 const verifying = () => process.env.CAMPFIRE_CACHE_VERIFY === "1";
@@ -409,15 +394,13 @@ export function sendCachedPage(req, res, tag, produce, cache = responseCache) {
     const deps = req.pageDeps;
     const validator =
       Object.keys(deps).length > 0 ? pageValidator(req, deps, true) : null;
-    const tail = validator && deps.tail && settleTail(deps.tail);
     if (pageEpoch() === epoch) {
-      if (validator && settled(validator.newest)) {
+      if (validator) {
         // search.found only spares the store-time search; entries keep the query alone.
         const { search, ...kept } = deps;
-        page.validator = validator.value;
+        page.validator = validator;
         page.deps = {
           ...kept,
-          ...(tail && { tail }),
           ...(search && { search: { query: search.query } }),
         };
       }

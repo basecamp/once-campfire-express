@@ -24,17 +24,9 @@ export const roomForUser = (user, id) =>
     Number(user?.id ?? user),
     Number(id),
   );
-const presentationColumns =
-  "m.*,u.name AS creator_name,u.bio AS creator_bio,u.updated_at AS creator_updated_at,r.name AS room_name,r.type AS room_type";
-const presentationJoins =
-  "JOIN users u ON u.id=m.creator_id JOIN rooms r ON r.id=m.room_id";
-export const presentation = `SELECT ${presentationColumns} FROM messages m ${presentationJoins}`;
-// Pages the messages first and joins the 40 survivors. Equivalent to joining first because
-// messages.creator_id and room_id are NOT NULL foreign keys (foreign_keys=ON), so the inner
-// joins never drop a row.
+export const presentation =
+  "SELECT m.*,u.name AS creator_name,u.bio AS creator_bio,u.updated_at AS creator_updated_at,r.name AS room_name,r.type AS room_type FROM messages m JOIN users u ON u.id=m.creator_id JOIN rooms r ON r.id=m.room_id";
 export const PAGE_SIZE = 40;
-export const pagedPresentation = (clauses, direction) =>
-  `SELECT ${presentationColumns} FROM (SELECT * FROM messages WHERE ${clauses} ORDER BY created_at ${direction}, id ${direction} LIMIT ${PAGE_SIZE}) m ${presentationJoins} ORDER BY m.created_at ${direction}, m.id ${direction}`;
 export const messageById = (id) =>
   get(presentation + " WHERE m.id=?", Number(id));
 export function messagesByIds(ids) {
@@ -85,32 +77,38 @@ export function directMembers(roomIds) {
       members.get(row.member_room_id).push(row);
   return members;
 }
-export function messagesForRoom(id, { before, after, around } = {}) {
+// Pages ids alone, which index_messages_on_room_id_and_created_at covers, and joins only the
+// shown messages. Equivalent to joining first because messages.creator_id and room_id are NOT
+// NULL foreign keys (foreign_keys=ON), so the inner joins never drop a row. The response cache
+// re-runs this selection to revalidate a page, so every window a page shows comes from here.
+// Rails orders the around= halves by created_at alone; ties are broken by id like the others.
+const pageIds = (clauses, direction, ...args) =>
+  all(
+    `SELECT id FROM messages WHERE ${clauses} ORDER BY created_at ${direction}, id ${direction} LIMIT ${PAGE_SIZE}`,
+    ...args,
+  ).map((row) => row.id);
+export function messageWindowIds(id, { before, after, around } = {}) {
+  const room = Number(id);
   if (around) {
     const pivot = get(
-      "SELECT * FROM messages WHERE id=? AND room_id=?",
+      "SELECT id,created_at FROM messages WHERE id=? AND room_id=?",
       Number(around),
-      Number(id),
+      room,
     );
-    if (!pivot) return messagesForRoom(id);
+    if (!pivot) return messageWindowIds(room);
     return [
-      ...all(
-        presentation +
-          ` WHERE m.room_id=? AND m.created_at<? ORDER BY m.created_at DESC LIMIT ${PAGE_SIZE}`,
-        Number(id),
+      ...pageIds(
+        "room_id=? AND created_at<?",
+        "DESC",
+        room,
         pivot.created_at,
       ).reverse(),
-      messageById(pivot.id),
-      ...all(
-        presentation +
-          ` WHERE m.room_id=? AND m.created_at>? ORDER BY m.created_at ASC LIMIT ${PAGE_SIZE}`,
-        Number(id),
-        pivot.created_at,
-      ),
+      pivot.id,
+      ...pageIds("room_id=? AND created_at>?", "ASC", room, pivot.created_at),
     ];
   }
   let clauses = "room_id=?",
-    args = [Number(id)];
+    args = [room];
   for (const [anchor, operator] of [
     [before, "<"],
     [after, ">"],
@@ -119,16 +117,18 @@ export function messagesForRoom(id, { before, after, around } = {}) {
       const pivot = get(
         "SELECT created_at FROM messages WHERE id=? AND room_id=?",
         Number(anchor),
-        Number(id),
+        room,
       );
       if (!pivot)
         throw Object.assign(new Error("Message not found"), { status: 404 });
       clauses += ` AND created_at${operator}?`;
       args.push(pivot.created_at);
     }
-  const rows = all(pagedPresentation(clauses, after ? "ASC" : "DESC"), ...args);
-  return after ? rows : rows.reverse();
+  const ids = pageIds(clauses, after ? "ASC" : "DESC", ...args);
+  return after ? ids : ids.reverse();
 }
+export const messagesForRoom = (id, window) =>
+  messagesByIds(messageWindowIds(id, window));
 // Read newest FTS matches without sorting the entire history. Sparse memberships
 // fall back after a bounded probe; hydration rechecks the current membership.
 export function searchMessageIds(userId, query) {

@@ -3,7 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { all, get } from "./db.js";
 import * as rails from "./rails.js";
-import { escape, plainText, renderBody } from "./richtext.js";
+import { embeddedBlobIds, escape, plainText, renderBody } from "./richtext.js";
 import { blobUrl, representationUrl } from "./storage.js";
 import { FragmentCache } from "./fragment_cache.js";
 // Output keeps nunjucks autoescape semantics byte for byte: null and undefined print nothing,
@@ -156,7 +156,7 @@ export function messageData(messages) {
     ).map((r) => [r.record_id, r]),
   );
   const boosts = all(
-    `SELECT b.*,u.name,u.bio,u.updated_at AS booster_updated_at FROM boosts b JOIN users u ON u.id=b.booster_id WHERE b.message_id IN (${placeholders}) ORDER BY b.created_at`,
+    `SELECT b.*,u.name,u.bio,u.updated_at AS booster_updated_at FROM boosts b JOIN users u ON u.id=b.booster_id WHERE b.message_id IN (${placeholders}) ORDER BY b.created_at, b.id`,
     ...ids,
   );
   return messages.map((m) => {
@@ -248,91 +248,60 @@ const templateDigest = templateSources
   .digest("hex")
   .slice(0, 12);
 
-// SHA-1 of message bodies by rich-text id. A hit needs the same updated_at, body length and body
-// head/tail sample, all selected without reading the body itself; a same-millisecond edit that
-// keeps length, head and tail is the one case this cannot tell apart from no edit.
-const bodyDigests = new Map();
-const BODY_DIGEST_ENTRIES = 50_000;
-const EMPTY_DIGEST = createHash("sha1").update("").digest("base64");
-const sha1 = (body) => createHash("sha1").update(body).digest("base64");
-
-function memoisedDigest(row) {
-  const known = bodyDigests.get(row.rich_id);
-  return known &&
-    known.updatedAt === row.rich_updated_at &&
-    known.length === row.body_length &&
-    known.edges === row.body_edges
-    ? known.digest
-    : undefined;
-}
-
-function memoiseDigest(row, digest) {
-  bodyDigests.delete(row.rich_id);
-  bodyDigests.set(row.rich_id, {
-    updatedAt: row.rich_updated_at,
-    length: row.body_length,
-    edges: row.body_edges,
-    digest,
-  });
-  if (bodyDigests.size > BODY_DIGEST_ENTRIES)
-    bodyDigests.delete(bodyDigests.keys().next().value);
-}
-
 const placeholders = (n) => Array(n).fill("?").join(",");
+const sha1 = (value) => createHash("sha1").update(value).digest("base64");
 
+// Rails keys on the message's updated_at alone. Writers that keep timestamps (replaceAttachment,
+// other processes, the sqlite3 CLI) exist, so the key is a digest of every row value messageData()
+// prints: the message and its creator and room columns, the whole body, the attachment blob, the
+// blobs the body embeds, the boosts in display order, and origin because Permalink embeds the
+// request host. Names of @mentioned users are not keyed, matching Rails, whose cached fragment
+// also keeps the old mention text until the message changes.
 export function messageCacheKeys(rows, origin = "") {
   if (!rows.length) return [];
   const ids = rows.map((m) => m.id);
-  const marks = placeholders(ids.length);
-  const versionRows = all(
-    `SELECT m.id,r.id AS rich_id,r.updated_at AS rich_updated_at,length(r.body) AS body_length,substr(r.body,1,32)||substr(r.body,-32) AS body_edges,a.blob_id FROM messages m LEFT JOIN action_text_rich_texts r ON r.record_type='Message' AND r.name='body' AND r.record_id=m.id LEFT JOIN active_storage_attachments a ON a.record_type='Message' AND a.name='attachment' AND a.record_id=m.id WHERE m.id IN (${marks})`,
+  const content = all(
+    `SELECT m.id,r.body,b.id AS blob_id,b.filename,b.content_type,(SELECT json_group_array(json_array(o.id,o.booster_id,o.updated_at,o.content,u.name,u.updated_at) ORDER BY o.created_at,o.id) FROM boosts o JOIN users u ON u.id=o.booster_id WHERE o.message_id=m.id) AS boosts FROM messages m LEFT JOIN action_text_rich_texts r ON r.record_type='Message' AND r.name='body' AND r.record_id=m.id LEFT JOIN active_storage_attachments a ON a.record_type='Message' AND a.name='attachment' AND a.record_id=m.id LEFT JOIN active_storage_blobs b ON b.id=a.blob_id WHERE m.id IN (${placeholders(ids.length)})`,
     ...ids,
+  ).map((r) => ({ ...r, embeds: embeddedBlobIds(r.body || "") }));
+  const embedIds = [...new Set(content.flatMap((r) => r.embeds))];
+  const embeds = new Map(
+    embedIds.length
+      ? all(
+          `SELECT id,filename,content_type FROM active_storage_blobs WHERE id IN (${placeholders(embedIds.length)})`,
+          ...embedIds,
+        ).map((b) => [b.id, [b.filename, b.content_type]])
+      : [],
   );
-  const digests = new Map();
-  const missed = [];
-  for (const r of versionRows) {
-    if (r.rich_id == null) continue;
-    const digest = memoisedDigest(r);
-    if (digest === undefined) missed.push(r);
-    else digests.set(r.rich_id, digest);
-  }
-  if (missed.length) {
-    const bodies = new Map(
-      all(
-        `SELECT id,body FROM action_text_rich_texts WHERE id IN (${placeholders(missed.length)})`,
-        ...missed.map((r) => r.rich_id),
-      ).map((r) => [r.id, r.body]),
-    );
-    for (const r of missed) {
-      const digest = sha1(bodies.get(r.rich_id) || "");
-      memoiseDigest(r, digest);
-      digests.set(r.rich_id, digest);
-    }
-  }
-  const contentVersions = new Map(
-    versionRows.map((r) => [
+  const versions = new Map(
+    content.map((r) => [
       r.id,
-      `${r.rich_id == null ? EMPTY_DIGEST : digests.get(r.rich_id)}-${r.blob_id ?? ""}`,
+      [
+        r.body,
+        r.blob_id,
+        r.filename,
+        r.content_type,
+        r.embeds.map((id) => [id, embeds.get(id) ?? null]),
+        r.boosts,
+      ],
     ]),
   );
-  const boostVersions = new Map();
-  for (const b of all(
-    `SELECT b.message_id,b.id,b.updated_at,b.content,u.name,u.updated_at AS booster_updated_at FROM boosts b JOIN users u ON u.id=b.booster_id WHERE b.message_id IN (${marks}) ORDER BY b.created_at`,
-    ...ids,
-  ))
-    boostVersions.set(
-      b.message_id,
-      (boostVersions.get(b.message_id) || "") +
-        `${b.id}-${b.updated_at}-${b.booster_updated_at}-${b.name}-${b.content},`,
-    );
-  // Rails keys on the message's updated_at alone. Timestamps have millisecond resolution here and
-  // replaceAttachment does not touch the message, so the key also carries the rendered inputs
-  // themselves: body digest, attachment blob, boost contents, creator/booster/room names and avatar versions, and
-  // origin because Permalink embeds the request host. Names of @mentioned users are not keyed,
-  // matching Rails, whose cached fragment also keeps the old mention text until the message changes.
   return rows.map(
     (m) =>
-      `message/${templateDigest}/${m.id}-${m.updated_at}/${contentVersions.get(m.id)}/${m.creator_updated_at}-${m.creator_name}/${m.room_name}/${boostVersions.get(m.id) || ""}/${origin}`,
+      `message/${templateDigest}/${m.id}/${sha1(
+        JSON.stringify([
+          m.updated_at,
+          m.created_at,
+          m.client_message_id,
+          m.creator_id,
+          m.creator_name,
+          m.creator_updated_at,
+          m.room_id,
+          m.room_name,
+          versions.get(m.id) ?? null,
+          origin,
+        ]),
+      )}`,
   );
 }
 

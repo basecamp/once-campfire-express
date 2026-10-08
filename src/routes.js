@@ -8,7 +8,6 @@ import {
   messageById,
   directMembers,
   messagesForRoom,
-  PAGE_SIZE,
   searchMessageIds,
   messagesByIds,
   refreshMessages,
@@ -51,23 +50,6 @@ import {
 import { enqueue } from "./jobs.js";
 import { htmlType, isFresh } from "./gzip.js";
 const token = () => randomBytes(18).toString("base64url");
-// Mirrors messagesForRoom(): a new message can change the window only if it sorts at or before
-// `until`, the before= anchor or the newest row of a full upward page. An unanchored window, or an
-// upward page with room left, takes any new message (until null). Ties with an around= pivot are
-// in neither half, so only a full after-half bounds that window.
-function windowTail(room, rows, { before, after, around } = {}) {
-  const full = (counted) =>
-    counted === PAGE_SIZE ? rows.at(-1).created_at : null;
-  if (around) {
-    const pivot = rows.findIndex((m) => m.id === Number(around));
-    return { room, until: pivot < 0 ? null : full(rows.length - pivot - 1) };
-  }
-  const bound = before
-    ? get("SELECT created_at FROM messages WHERE id=?", Number(before))
-        .created_at
-    : null;
-  return { room, until: (after && full(rows.length)) || bound };
-}
 const messagesEtag = (keys) =>
   `W/"${createHash("sha1").update(keys.join("|")).digest("hex")}"`;
 const origin = (req) => `${req.protocol}://${req.headers.host}`;
@@ -373,11 +355,12 @@ export function registerRoutes(app) {
       req.lastRoom = room.id;
       req.session.last_room_id = room.id;
       sendCachedPage(req, res, "room", () => {
-        const rows = messagesForRoom(room.id, { around: req.params.messageId });
+        const shown = { around: req.params.messageId };
+        const rows = messagesForRoom(room.id, shown);
         dependOn(req, {
           room: room.id,
           messages: rows.map((m) => m.id),
-          tail: windowTail(room.id, rows, { around: req.params.messageId }),
+          window: { room: room.id, ...shown },
         });
         return render(req, "room", {
           Room: roomData(room, req.user),
@@ -477,16 +460,20 @@ export function registerRoutes(app) {
                 });
               })
             : sendCachedPage(req, res, "messages", () => {
-                const rows = messagesForRoom(room.id, req.query);
-                if (!rows.length) return void res.sendStatus(204);
                 const { before, after, around } = req.query;
+                const rows = messagesForRoom(room.id, {
+                  before,
+                  after,
+                  around,
+                });
+                if (!rows.length) return void res.sendStatus(204);
                 dependOn(req, {
                   // Paging anchors are not shown but must still exist.
                   messages: [
                     ...rows.map((m) => m.id),
                     ...[before, after].filter(Boolean).map(Number),
                   ],
-                  tail: windowTail(room.id, rows, req.query),
+                  window: { room: room.id, before, after, around },
                 });
                 const keys = messageCacheKeys(rows);
                 res.header("ETag", messagesEtag(keys));
@@ -1314,9 +1301,7 @@ function registerSearch(app) {
   });
   function search(req, query) {
     const found = searchMessageIds(req.user.id, query);
-    const rows = messagesByIds(found).sort((a, b) =>
-      a.created_at.localeCompare(b.created_at),
-    );
+    const rows = messagesByIds(found).sort((a, b) => a.id - b.id);
     dependOn(req, {
       search: { query, found },
       messages: rows.map((m) => m.id),

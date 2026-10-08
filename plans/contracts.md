@@ -39,7 +39,8 @@ hardware threads; Express uses three HTTP workers and its primary job/fanout pro
 ## Runtime, templates and caches: known differences
 
 Node 24 is the only runtime (`.node-version`, `Dockerfile`, `node:sqlite`). Unit tests alone do not establish production parity; the
-branch needs fresh production Docker checks and re-measured benchmarks.
+production image passed the shared route contracts and write audits in a local benchmark run on 2026-10-08
+(README Benchmarks). It has not yet run in shared verification or the shared browser flows.
 
 - Templates: Eta 4.6.0, one `templates/eta/*.eta` per former nunjucks macro, converted
   mechanically from `templates/pages.html` by `bin/nunjucks-to-eta.js`. Output is
@@ -53,20 +54,23 @@ branch needs fresh production Docker checks and re-measured benchmarks.
   change (other workers, jobs). Contract: every main-DB write goes through db.js
   `run()`/`transaction()`.
 - Message fragment cache (`CAMPFIRE_FRAGMENT_CACHE_MB`, default 32, per worker). Key:
-  id/`updated_at`, content hash, creator/booster/room names, avatar versions, origin,
-  template digest. Differs from Rails: creator/booster renames show immediately (Rails'
-  `cache [message, ...]` keeps them stale); @mention names stay stale until the message
-  changes, as in Rails.
+  template digest, origin and a digest of every value the fragment prints (message row,
+  whole body, attachment and embedded blob names and types, boosts in display order,
+  creator/booster/room names, avatar versions). Differs from Rails: writes that keep
+  timestamps and creator/booster renames show immediately (Rails' `cache [message, ...]`
+  keys on `updated_at`); @mention names stay stale until the message changes, as in Rails.
 - Messages page answers 304 via ETag from the fragment keys (Rails `fresh_when @messages`).
 - Action Cable authorization memo `CABLE_AUTH_TTL_MS` (default 1000): revocation is
   immediate in the worker that performs it (`forgetUser`), within the TTL elsewhere.
 - Integers above 2^53 read from SQLite throw; Campfire's schema stores none.
+- Two indexes absent from the Rails schema are created at startup (`CREATE INDEX IF NOT
+  EXISTS`, tables unchanged): `messages(room_id, updated_at)` for room refresh and
+  `messages(room_id, created_at)`, which covers message paging and response-cache window
+  revalidation. The `around` halves break `created_at` ties by id like the other pages
+  (Rails leaves their order to SQLite).
 - `WEB_WORKERS` defaults to `auto` (`os.availableParallelism()`, respecting cpusets). Cluster
   workers listen with `reusePort` on Linux (`REUSE_PORT=0` disables).
-- HTML ETags are `W/"<length>-<crc32>"`. The message
-  body digest memo keys on `updated_at`, length and a head/tail sample, so a same-millisecond
-  edit with identical length, head and tail can serve stale cached HTML (Rails keys on
-  `updated_at` alone).
+- HTML ETags are `W/"<length>-<crc32>"`.
 - HTTP runs on Fastify 5 (`@fastify/static`, `@fastify/multipart`, `@fastify/compress`,
   `@fastify/cookie`, `@fastify/accepts`; `qs` for query strings and form bodies) instead of
   Express 5. Routes, statuses, redirects, cookies, CSRF, uploads and caching are functionally
@@ -76,7 +80,8 @@ branch needs fresh production Docker checks and re-measured benchmarks.
   `src/router.js`, which also keeps Express's ordered `next()` fall-through between
   same-shaped routes (`/rooms/:kind` before `/rooms/:roomId`). `/up//` gets 403 from the
   static fallback where Express answered 404. Verified by `npm test` and a seed smoke run
-  (single and cluster workers); not re-benchmarked.
+  (single and cluster workers), and by the production image passing the shared route contracts
+  and write audits in a local benchmark run (see README Benchmarks).
 - CSRF: `Sec-Fetch-Site` replaces tokens. Writes accept `same-origin` and `same-site`,
   reject `cross-site`, `none`, invalid values and missing headers over HTTPS with 422.
   A provided Origin must match the effective origin, including its port; null and empty
@@ -96,10 +101,14 @@ branch needs fresh production Docker checks and re-measured benchmarks.
   revalidated, like Rails cache keys: a few indexed reads of exactly what the page prints
   (viewer/account rows, logo, room row, involvement, direct members, sidebar rooms with
   unread flags, recent searches, the shown messages with creators, room names, attachments
-  and boosts, a re-run FTS search, and whether a new message entered the shown window).
-  A match is served and re-stamped; posts to other rooms keep pages. Message bodies are
-  compared by rich-text `updated_at`/length/edges, so a page showing a message posted or
-  edited in the last 15 s (or under `CAMPFIRE_FROZEN_TIME`) is kept for its epoch only.
+  and boosts, a re-run FTS search, and the ids of the shown window).
+  A match is served and re-stamped; posts to other rooms keep pages. Shown messages are
+  compared by their fragment keys, so no timestamp stands in for content. The shown window
+  is selected again, ids only, from the arguments the page used (room and `before`/`after`/
+  `around` anchor, falling back to the latest page when an `around` anchor is gone), so any
+  write that adds, deletes or moves a message into or out of it re-renders the page,
+  including a foreign one rewriting `room_id` or `created_at`; writes that leave it as it was
+  keep the page. The selection reads only the `messages(room_id, created_at)` index.
   `CAMPFIRE_CACHE_VERIFY=1` re-renders every revalidated hit, serves and counts the fresh
   page on a mismatch. Mention names stay as cached, like the fragment cache. Rails has no
   equivalent; output is unchanged. Session and access checks run on every request;
@@ -107,15 +116,19 @@ branch needs fresh production Docker checks and re-measured benchmarks.
   security headers stay fresh. HEAD reuses GET bodies but never stores; flash-bearing
   and bot-authenticated responses bypass the cache.
   Verified in-process only: randomized domain/HTTP writes and a second SQLite connection,
-  each cached page compared byte for byte with an uncached render. Assumes the system clock
-  never steps back more than 15 s; not yet exercised across production cluster workers.
+  each cached page compared byte for byte with an uncached render (and, for writes that keep
+  timestamps, with a render that rebuilds every message fragment); not yet exercised across
+  production cluster workers.
 - Large HTML is gzip, not brotli: spliced from cached deflate pieces (`CAMPFIRE_GZIP_CACHE_MB`,
   default 32) or built once per cached page. Digested assets are served from precompressed
   `.br`/`.gz` files built by `bin/build-assets.js`; the file set is read at startup.
 - Public responses are kept in memory per worker (`CAMPFIRE_PUBLIC_CACHE_MB`, default 32, 0
   disables; LRU): each digested asset variant (identity/br/gzip) with prebuilt headers is answered
-  before Fastify, and avatar bodies are keyed by their ETag, which covers user name,
-  `updated_at` and avatar blob, so changes show on the next request. A file is read on its
+  before Fastify, and avatar bodies are keyed by their ETag, which covers every body input
+  (user id, name, role, `updated_at` and the avatar blob's id, key and checksum), so changes,
+  including a foreign role change to bot that leaves `updated_at` alone, show on the next
+  request that reaches the server; browsers keep their copy for the 30-minute `max-age`
+  because the printed `?v=` follows `updated_at` only. A file is read on its
   first request (served from disk meanwhile) and never re-read (files over half the budget
   are never read, and ones resized since startup never stored). Range, `If-Match`,
   `If-Unmodified-Since` and on-the-fly-compressed requests keep the file-serving chain. Status,

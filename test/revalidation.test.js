@@ -15,9 +15,9 @@ const rails = await import("../src/rails.js");
 const storage = await import("../src/storage.js");
 const { createServer: createAppServer } = await import("../src/app.js");
 const { responseCache } = await import("../src/response_cache.js");
+const { messageFragments } = await import("../src/rendering.js");
 
-// Timestamps a page shows must be SETTLE_MS old before the page is revalidated; the tests move a
-// frozen clock forward instead of waiting.
+// A frozen clock that the tests move forward, so writes can share or skip timestamps on demand.
 const clockStart = Date.now() + 3600_000;
 let tick = 0;
 const advance = () => {
@@ -157,6 +157,20 @@ async function checked(user, path) {
   assert.ok(
     cachedPage.body.equals(fresh.body),
     `${path} for user ${user.id} differs from an uncached render`,
+  );
+  return cachedPage;
+}
+
+// Like checked(), but the reference render also rebuilds every message fragment, so a stale
+// fragment reused by both renders cannot hide behind a matching page.
+async function pristine(user, path) {
+  const cachedPage = await request(user, path);
+  messageFragments.clear();
+  const fresh = await uncached(() => request(user, path));
+  assert.equal(cachedPage.status, fresh.status, `${path} status`);
+  assert.ok(
+    cachedPage.body.equals(fresh.body),
+    `${path} for user ${user.id} differs from a render without cached fragments`,
   );
   return cachedPage;
 }
@@ -374,30 +388,228 @@ test("full anchored windows ignore later posts but not backdated ones", async ()
     assert.equal((await counted(() => checked(admin, path))).invalidated, 1);
 });
 
-test("a page showing a body edited moments ago is cached for its epoch only", async () => {
+test("a page showing a body edited moments ago revalidates by content", async () => {
   const { admin, member } = users;
   advance();
   const id = newestIn(rooms.secret);
   const path = `/rooms/${rooms.secret.id}/messages/${id}`;
-  await request(admin, path, {
-    form: { _method: "patch", "message[body]": "<p>edited</p>" },
-  });
+  const edit = (body) =>
+    request(admin, path, {
+      form: { _method: "patch", "message[body]": body },
+    });
+  await edit("<p>edited</p>");
   await checked(admin, path);
   await request(member, `/rooms/${rooms.other.id}/messages`, {
     form: { "message[body]": "unrelated" },
   });
-  const unsettled = await counted(() => checked(admin, path));
-  assert.deepEqual([unsettled.misses, unsettled.revalidated], [1, 0]);
+  const kept = await counted(() => checked(admin, path));
+  assert.deepEqual([kept.revalidated, kept.misses], [1, 0]);
+  await edit("<p>edits!</p>");
+  const reedited = await counted(() => pristine(admin, path));
+  assert.equal(reedited.invalidated, 1, "same length, same millisecond");
+  assert.match(reedited.result.body.toString(), /edits!/);
+});
+
+test("foreign writes that keep every timestamp reach revalidated pages and fragments", async () => {
+  const { admin, member } = users;
+  const room = seedRoom("Untimed", "Rooms::Open", [admin, member]);
+  const filler = "lorem ipsum ".repeat(4);
+  const middle = domain.createMessage(
+    room.id,
+    member.id,
+    `<p>${filler}the answer is yes ${filler}</p>`,
+  );
+  const attached = domain.createMessage(room.id, member.id, "<p></p>");
+  const attachment = storage.replaceAttachment(
+    {
+      buffer: Buffer.from("png"),
+      originalname: "photo.png",
+      mimetype: "image/png",
+    },
+    "Message",
+    attached.id,
+    "attachment",
+  );
+  const inline = domain.createMessage(room.id, member.id, "<p>inline</p>");
+  const embedded = storage.replaceAttachment(
+    {
+      buffer: Buffer.from("doc"),
+      originalname: "notes.txt",
+      mimetype: "text/plain",
+    },
+    "Message",
+    attached.id,
+    "spare",
+  );
+  run(
+    "UPDATE action_text_rich_texts SET body=? WHERE record_type='Message' AND record_id=?",
+    `<p>inline <action-text-attachment sgid="${rails.sgid("ActiveStorage::Blob", embedded.id)}"></action-text-attachment></p>`,
+    inline.id,
+  );
+  const boosted = domain.createMessage(room.id, member.id, "<p>boosted</p>");
+  for (const content of ["🥇", "🥈"])
+    run(
+      "INSERT INTO boosts(message_id,booster_id,content,created_at,updated_at) VALUES(?,?,?,?,?)",
+      boosted.id,
+      admin.id,
+      content,
+      now(),
+      now(),
+    );
   advance();
-  await request(member, `/rooms/${rooms.other.id}/messages`, {
-    form: { "message[body]": "unrelated again" },
-  });
-  const settled = await counted(() => checked(admin, path));
-  assert.equal(settled.misses, 1, "stored epoch-only before the clock moved");
-  await request(member, `/rooms/${rooms.other.id}/messages`, {
-    form: { "message[body]": "and again" },
-  });
-  assert.equal((await counted(() => checked(admin, path))).revalidated, 1);
+  const path = `/rooms/${room.id}`;
+  const foreignly = async (sql, ...params) => {
+    withForeign((foreign) => foreign.prepare(sql).run(...params));
+    return (await pristine(admin, path)).body.toString();
+  };
+  await pristine(admin, path);
+
+  let html = await foreignly(
+    "UPDATE action_text_rich_texts SET body=replace(body,'yes','no!') WHERE record_type='Message' AND record_id=?",
+    middle.id,
+  );
+  assert.match(html, /the answer is no!/);
+  html = await foreignly(
+    "UPDATE active_storage_blobs SET filename='clip.mp4',content_type='video/mp4' WHERE id=?",
+    attachment.id,
+  );
+  assert.match(html, /<video [^>]*clip\.mp4/);
+  html = await foreignly(
+    "UPDATE active_storage_blobs SET filename='renamed.txt' WHERE id=?",
+    embedded.id,
+  );
+  assert.match(html, />renamed\.txt</);
+  html = await foreignly(
+    "UPDATE messages SET client_message_id='foreign-client-id' WHERE id=?",
+    inline.id,
+  );
+  assert.match(html, /id="message_foreign-client-id"/);
+  html = await foreignly(
+    "UPDATE messages SET created_at='2001-02-03 04:05:06.000000' WHERE id=?",
+    middle.id,
+  );
+  assert.match(html, /2001-02-03/);
+  html = await foreignly(
+    "UPDATE boosts SET created_at='2000-01-01 00:00:00.000000' WHERE message_id=? AND content='🥈'",
+    boosted.id,
+  );
+  assert.ok(html.indexOf("🥈") < html.indexOf("🥇"), "boosts reordered");
+});
+
+test("a message moved between direct rooms re-renders its permalinks", async () => {
+  const { admin, member, third } = users;
+  const first = seedRoom(null, "Rooms::Direct", [admin, member]);
+  const second = seedRoom(null, "Rooms::Direct", [admin, third]);
+  const message = domain.createMessage(first.id, admin.id, "<p>moving</p>");
+  advance();
+  const path = `/messages/${message.id}`;
+  await pristine(admin, path);
+  withForeign((foreign) =>
+    foreign
+      .prepare("UPDATE messages SET room_id=? WHERE id=?")
+      .run(second.id, message.id),
+  );
+  const moved = (await pristine(admin, path)).body.toString();
+  assert.match(moved, new RegExp(`/rooms/${second.id}/@${message.id}`));
+});
+
+test("foreign writes that move older messages into a shown window re-render it", async () => {
+  const { admin, member } = users;
+  const room = seedRoom("Window", "Rooms::Open", [admin, member]);
+  const strays = seedRoom("Strays", "Rooms::Open", [admin, member]);
+  advance();
+  // Created before the window's messages, so its id is below every id the window shows.
+  const stray = domain.createMessage(strays.id, member.id, "<p>stray</p>");
+  const ids = [];
+  for (let i = 0; i < 90; i++) {
+    advance();
+    ids.push(domain.createMessage(room.id, admin.id, `<p>window ${i}</p>`).id);
+  }
+  advance();
+  run("UPDATE messages SET created_at=? WHERE id=?", now(), stray.id);
+  advance();
+  const created = (id) =>
+    get("SELECT created_at FROM messages WHERE id=?", id).created_at;
+  const latest = [`/rooms/${room.id}`, `/rooms/${room.id}/messages`];
+  // Before half ids[20..59], after half ids[61..] with room to spare.
+  const around = [
+    `/rooms/${room.id}/@${ids[60]}`,
+    `/rooms/${room.id}/messages?around=${ids[60]}`,
+  ];
+  // ids[5..44]
+  const older = `/rooms/${room.id}/messages?before=${ids[45]}`;
+  const all = [...latest, ...around, older];
+  for (const path of all) await pristine(admin, path);
+  const expect = async (step, changed) => {
+    for (const path of all) {
+      const counts = await counted(() => pristine(admin, path));
+      const outcome = changed.includes(path) ? "invalidated" : "revalidated";
+      assert.equal(counts[outcome], 1, `${step}: ${path} ${outcome}`);
+    }
+  };
+  const foreignly = (sql, ...params) =>
+    withForeign((foreign) => foreign.prepare(sql).run(...params));
+  const insert = (createdAt, body) =>
+    withForeign((foreign) => {
+      const id = foreign
+        .prepare(
+          "INSERT INTO messages(room_id,creator_id,client_message_id,created_at,updated_at) VALUES(?,?,?,?,?)",
+        )
+        .run(room.id, member.id, body, createdAt, createdAt).lastInsertRowid;
+      foreign
+        .prepare(
+          "INSERT INTO action_text_rich_texts(name,record_type,record_id,body,created_at,updated_at) VALUES('body','Message',?,?,?,?)",
+        )
+        .run(id, `<p>${body}</p>`, createdAt, createdAt);
+    });
+
+  insert(now(), "newest");
+  await expect("a new message after the before= window", [
+    ...latest,
+    ...around,
+  ]);
+  foreignly(
+    "UPDATE messages SET created_at=(SELECT max(created_at) FROM messages WHERE room_id=?) WHERE id=?",
+    room.id,
+    ids[0],
+  );
+  await expect("the oldest message moved to the newest", [
+    ...latest,
+    ...around,
+  ]);
+  foreignly("UPDATE messages SET room_id=? WHERE id=?", room.id, stray.id);
+  await expect("a newer message moved in from another room", [
+    ...latest,
+    ...around,
+  ]);
+  foreignly(
+    "UPDATE messages SET created_at=? WHERE id=?",
+    created(ids[30]),
+    ids[88],
+  );
+  await expect("a shown message moved back into older windows", all);
+  insert(created(ids[40]), "backdated");
+  await expect("a new message inside the before= window", [older, ...around]);
+});
+
+test("window selections walk index_messages_on_room_id_and_created_at alone", () => {
+  for (const [clauses, direction] of [
+    ["room_id=?1", "DESC"],
+    ["room_id=?1 AND created_at<?2", "DESC"],
+    ["room_id=?1 AND created_at>?2", "ASC"],
+  ]) {
+    const plan = all(
+      `EXPLAIN QUERY PLAN SELECT id FROM messages WHERE ${clauses} ORDER BY created_at ${direction}, id ${direction} LIMIT 40`,
+      ...[rooms.lobby.id, now()].slice(0, clauses.split("?").length - 1),
+    ).map((step) => step.detail);
+    assert.deepEqual(
+      plan,
+      [
+        `SEARCH messages USING COVERING INDEX index_messages_on_room_id_and_created_at (${clauses.replaceAll(/\?\d/g, "?")})`,
+      ],
+      clauses,
+    );
+  }
 });
 
 // A small deterministic PRNG so a failing sequence can be replayed with CAMPFIRE_TEST_SEED.

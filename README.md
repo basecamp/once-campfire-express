@@ -43,6 +43,21 @@ with four hardware cores allocated to each app.
 
 [Shared verification](https://github.com/basecamp/once-campfire-verification) · [Detailed results](https://github.com/basecamp/once-campfire-verification/blob/main/docs/performance-review.md).
 
+This branch (Node.js 24 + Fastify with the review fixes) was measured locally with the shared
+harness (`once-campfire-verification` `8c75704`, route-contract-v1, canonical seed, every response
+validated and every acknowledged write audited). The machine is an AMD Ryzen 7 5800X: four hardware
+threads for the servers, four for the client, 16 clients, median of 3 rounds. Rust is `main` `2e392fe`,
+built on the same machine. These are not shared-verification results, and they are not comparable
+with the table above, which was measured on different hardware.
+
+| HTTP workload (requests/sec) | Node.js + Fastify (this branch) | Rust `2e392fe` |
+|---|---:|---:|
+| Room page | 20,959 | 37,409 |
+| Messages page | 34,372 | 35,746 |
+| Sidebar | 43,656 | 41,840 |
+| Search | 41,182 | 40,608 |
+| Post a message | 1,762 | 3,857 |
+
 ## Known differences
 
 - Sidebar connection refresh waits for the current Turbo frame to finish loading,
@@ -63,7 +78,8 @@ with four hardware cores allocated to each app.
   `src/router.js`, which also keeps Express's ordered `next()` fall-through between
   same-shaped routes (`/rooms/:kind` before `/rooms/:roomId`). `/up//` gets 403 from the
   static fallback where Express answered 404. Verified by `npm test` and a seed smoke run
-  (single and cluster workers); not re-benchmarked.
+  (single and cluster workers), and by the production image passing the shared route contracts
+  and write audits in a local benchmark run (see README Benchmarks).
 - CSRF: `Sec-Fetch-Site` replaces tokens. Writes accept `same-origin` and `same-site`,
   reject `cross-site`, `none`, invalid values and missing headers over HTTPS with 422.
   A provided Origin must match the effective origin, including its port; null and empty
@@ -80,6 +96,11 @@ with four hardware cores allocated to each app.
 - HTML whitespace and malformed-fragment repair can differ. Full byte parity is not claimed.
 - Direct-room autocomplete explicitly requests JSON, repairing the original fetch-header bug.
 - Integers above 2^53 read from SQLite throw (`node:sqlite`); the Campfire schema stores none.
+- Two indexes absent from the Rails schema are created at startup (`CREATE INDEX IF NOT
+  EXISTS`, tables unchanged): `messages(room_id, updated_at)` for room refresh and
+  `messages(room_id, created_at)`, which covers message paging and response-cache window
+  revalidation. The `around` halves break `created_at` ties by id like the other pages
+  (Rails leaves their order to SQLite).
 - Eta templates replace nunjucks with byte-identical output (fuzz and snapshot checked,
   escaping identical including backslash). `push_subscriptions` with two or more
   subscriptions threw under nunjucks and now renders.
@@ -89,9 +110,11 @@ with four hardware cores allocated to each app.
   (`CAMPFIRE_QUERY_CACHE_ENTRIES`, default 1000), cleared on own writes and when
   `PRAGMA data_version` shows another worker or job committed.
 - Rendered messages use a per-worker fragment cache (`CAMPFIRE_FRAGMENT_CACHE_MB`,
-  default 32). The key covers id/`updated_at`, a content hash, creator/booster/room names,
-  avatar versions, origin and template digest, so creator and booster renames show
-  immediately (Rails keeps them stale). @mention names stay stale until the message
+  default 32). The key digests every value the fragment prints (message row, whole body,
+  attachment and embedded blob names and types, boosts in display order, creator/booster/room
+  names and avatar versions), origin and template digest, so writes that keep timestamps
+  (other processes, the sqlite3 CLI) and creator and booster renames show immediately (Rails
+  keys on `updated_at` and keeps them stale). @mention names stay stale until the message
   changes, as in Rails.
 - The messages page answers 304 from an ETag built from the fragment keys (Rails
   `fresh_when @messages`).
@@ -103,10 +126,14 @@ with four hardware cores allocated to each app.
   revalidated, like Rails cache keys: a few indexed reads of exactly what the page prints
   (viewer/account rows, logo, room row, involvement, direct members, sidebar rooms with
   unread flags, recent searches, the shown messages with creators, room names, attachments
-  and boosts, a re-run FTS search, and whether a new message entered the shown window).
-  A match is served and re-stamped; posts to other rooms keep pages. Message bodies are
-  compared by rich-text `updated_at`/length/edges, so a page showing a message posted or
-  edited in the last 15 s (or under `CAMPFIRE_FROZEN_TIME`) is kept for its epoch only.
+  and boosts, a re-run FTS search, and the ids of the shown window).
+  A match is served and re-stamped; posts to other rooms keep pages. Shown messages are
+  compared by their fragment keys, so no timestamp stands in for content. The shown window
+  is selected again, ids only, from the arguments the page used (room and `before`/`after`/
+  `around` anchor, falling back to the latest page when an `around` anchor is gone), so any
+  write that adds, deletes or moves a message into or out of it re-renders the page,
+  including a foreign one rewriting `room_id` or `created_at`; writes that leave it as it was
+  keep the page. The selection reads only the `messages(room_id, created_at)` index.
   `CAMPFIRE_CACHE_VERIFY=1` re-renders every revalidated hit, serves and counts the fresh
   page on a mismatch. Mention names stay as cached, like the fragment cache. Rails has no
   equivalent; output is unchanged. Session and access checks run on every request;
@@ -118,8 +145,11 @@ with four hardware cores allocated to each app.
   `.br`/`.gz` files built by `bin/build-assets.js`; the file set is read at startup.
 - Public responses are kept in memory per worker (`CAMPFIRE_PUBLIC_CACHE_MB`, default 32, 0
   disables; LRU): each digested asset variant (identity/br/gzip) with prebuilt headers is answered
-  before Fastify, and avatar bodies are keyed by their ETag, which covers user name,
-  `updated_at` and avatar blob, so changes show on the next request. A file is read on its
+  before Fastify, and avatar bodies are keyed by their ETag, which covers every body input
+  (user id, name, role, `updated_at` and the avatar blob's id, key and checksum), so changes,
+  including a foreign role change to bot that leaves `updated_at` alone, show on the next
+  request that reaches the server; browsers keep their copy for the 30-minute `max-age`
+  because the printed `?v=` follows `updated_at` only. A file is read on its
   first request (served from disk meanwhile) and never re-read (files over half the budget
   are never read, and ones resized since startup never stored). Range, `If-Match`,
   `If-Unmodified-Since` and on-the-fly-compressed requests keep the file-serving chain, whose

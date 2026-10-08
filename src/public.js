@@ -69,6 +69,14 @@ function cache(req, res, etag) {
   }
   return false;
 }
+// Every field buildAvatar reads, so a foreign writer that leaves updated_at alone still changes the ETag.
+const avatarInputs = (user, blob) => [
+  user.id,
+  user.name,
+  user.role,
+  user.updated_at,
+  blob && [blob.id, blob.key, blob.checksum],
+];
 async function buildAvatar(user, blob) {
   if (blob) {
     const out = await variant(blob, [512, 512], "webp");
@@ -133,7 +141,7 @@ export function registerPublic(app) {
       const blob = attachment("User", user.id, "avatar");
       const etag = `"${crypto
         .createHash("sha256")
-        .update(JSON.stringify([user.id, user.name, user.updated_at, blob?.id]))
+        .update(JSON.stringify(avatarInputs(user, blob)))
         .digest("hex")}"`;
       if (cache(req, res, etag)) return;
       // The ETag covers every input of the body, so an entry under it never goes stale.

@@ -429,6 +429,28 @@ test("message cache keys see a body change that keeps updated_at", () => {
   assert.notEqual(messageCacheKeys([row])[0], first);
 });
 
+test("message cache keys see a middle edit that keeps length, edges and timestamps", () => {
+  const padding = "x".repeat(40);
+  const message = domain.createMessage(
+    open.id,
+    admin.id,
+    `<p>${padding} yes ${padding}</p>`,
+  );
+  const row = domain.messageById(message.id);
+  const [first] = messageCacheKeys([row]);
+  const foreign = openDatabase(databaseFile());
+  try {
+    foreign
+      .prepare(
+        "UPDATE action_text_rich_texts SET body=replace(body,' yes ',' no! ') WHERE record_type='Message' AND record_id=?",
+      )
+      .run(message.id);
+  } finally {
+    foreign.close();
+  }
+  assert.notEqual(messageCacheKeys([row])[0], first);
+});
+
 test("a cache miss encodes the rendered page to bytes once and answers 304 on the fast ETag", async () => {
   const path = `/rooms/${open.id}`;
   responseCache.clear?.();

@@ -1064,6 +1064,33 @@ test("sidebar direct rows also invalidate on related-user writes", async () => {
   }
 });
 
+test("search pages list backdated matches in insertion order", async () => {
+  const http = await httpSession(admin, "search-order-session");
+  try {
+    const older = domain.createMessage(
+      open.id,
+      admin.id,
+      "<p>ordermarker first</p>",
+    );
+    const newer = domain.createMessage(
+      open.id,
+      admin.id,
+      "<p>ordermarker second</p>",
+    );
+    run(
+      "UPDATE messages SET created_at='2001-01-01 00:00:00.000000' WHERE id=?",
+      newer.id,
+    );
+    const html = await http.page("/searches?q=ordermarker");
+    const ids = [...html.matchAll(/data-message-id="(\d+)"/g)].map(
+      (m) => +m[1],
+    );
+    assert.deepEqual(ids, [older.id, newer.id]);
+  } finally {
+    await http.close();
+  }
+});
+
 test("a posted message answers with the same fragment it broadcasts and indexes it once", async () => {
   const { cachedMessages } = await import("../src/rendering.js");
   const http = await httpSession(admin, "turbo-post-session");

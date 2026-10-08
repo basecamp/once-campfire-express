@@ -108,18 +108,57 @@ export function canonicalize(body = "") {
     );
   });
 }
-export function attachedBlob(attrs) {
+const ATTACHMENT =
+  /<action-text-attachment\b([^>]*)>(?:[\s\S]*?<\/action-text-attachment>)?/g;
+const nodeAttributes = (node) =>
+  Object.fromEntries((node?.attrs || []).map((a) => [a.name, a.value]));
+const attachmentAttributes = (html) =>
+  nodeAttributes(parseFragment(html).childNodes[0]);
+function blobId(sgid) {
   try {
-    const gid = verifySgid(attrs.sgid || "");
-    const match = gid.match(
+    const id = verifySgid(sgid || "").match(
       /^gid:\/\/campfire\/ActiveStorage::Blob\/(\d+)(?:\?|$)/,
-    );
-    return match
-      ? get("SELECT * FROM active_storage_blobs WHERE id=?", Number(match[1]))
-      : null;
+    )?.[1];
+    return id ? Number(id) : null;
   } catch {
     return null;
   }
+}
+export function attachedBlob(attrs) {
+  const id = blobId(attrs.sgid);
+  return id ? get("SELECT * FROM active_storage_blobs WHERE id=?", id) : null;
+}
+const plainTree = (body) =>
+  parseFragment(
+    canonicalize(body)
+      .replace(/^[ \t\n\v\f\r\0]+|[ \t\n\v\f\r\0]+$/g, "")
+      .replace(/\r\n?/g, "\n")
+      .replace(/\0/g, ""),
+  );
+// renderBody finds attachments in the sanitized HTML and plainText in its own parse of the
+// canonical body; the parsers disagree on malformed markup, so the sgids come from both. Parsing
+// is pure, so it is memoized per body, but verification runs every time because sgids expire.
+const sgidsByBody = new Map();
+function attachmentSgids(body) {
+  let sgids = sgidsByBody.get(body);
+  if (sgids) return sgids;
+  const found = new Set();
+  for (const [html] of sanitize(body).matchAll(ATTACHMENT))
+    found.add(attachmentAttributes(html).sgid);
+  (function collect(node) {
+    if (node.tagName === "action-text-attachment")
+      found.add(nodeAttributes(node).sgid);
+    for (const child of node.childNodes || []) collect(child);
+  })(plainTree(body));
+  if (sgidsByBody.size >= 256) sgidsByBody.clear();
+  sgidsByBody.set(body, (sgids = [...found]));
+  return sgids;
+}
+// Ids of every blob that renderBody or plainText may read for this body.
+export function embeddedBlobIds(body = "") {
+  // Bare action-text-attachment tags and trix figures (data-trix-attachment) both say "attachment".
+  if (!body.includes("attachment")) return [];
+  return [...new Set(attachmentSgids(body).map(blobId).filter(Boolean))];
 }
 export function plainText(body = "") {
   function visit(node) {
@@ -172,14 +211,7 @@ export function plainText(body = "") {
     }
     return text;
   }
-  return visit(
-    parseFragment(
-      canonicalize(body)
-        .replace(/^[ \t\n\v\f\r\0]+|[ \t\n\v\f\r\0]+$/g, "")
-        .replace(/\r\n?/g, "\n")
-        .replace(/\0/g, ""),
-    ),
-  ).replace(/[\r\n]+$/, "");
+  return visit(plainTree(body)).replace(/[\r\n]+$/, "");
 }
 export function mentionIds(body) {
   // reference/lib/rails_ext/action_text_attachables.rb retains User mentions across key rotation.
@@ -238,33 +270,25 @@ export function reconcileEmbeds(richId, body, userId = null) {
   return obsolete.map((a) => a.blob_id);
 }
 export function renderBody(body) {
-  return sanitize(body).replace(
-    /<action-text-attachment\b([^>]*)>(?:[\s\S]*?<\/action-text-attachment>)?/g,
-    (full, attrs) => {
-      const token = attrs.match(/\bsgid=["']([^"']+)/)?.[1];
-      try {
-        const id = unverifiedUserGid(token);
-        const user = id && get("SELECT * FROM users WHERE id=?", Number(id));
-        if (user)
-          return `<span class="mention" data-user-id="${user.id}"><a href="/users/${user.id}">${escape(user.name)}</a></span>`;
-      } catch {}
-      const attributes = Object.fromEntries(
-          parseFragment(full).childNodes[0]?.attrs?.map((a) => [
-            a.name,
-            a.value,
-          ]) || [],
-        ),
-        blob = attachedBlob(attributes);
-      if (blob) {
-        const url = blobUrl(blob),
-          filename = escape(blob.filename);
-        if ((blob.content_type || "").startsWith("image/"))
-          return `<figure class="attachment attachment--preview"><a href="${url}"><img src="${representationUrl(blob)}" alt="${filename}"></a>${attributes.caption ? "<figcaption>" + escape(attributes.caption) + "</figcaption>" : ""}</figure>`;
-        return `<a href="${url}?disposition=attachment">${filename}</a>`;
-      }
-      return "";
-    },
-  );
+  return sanitize(body).replace(ATTACHMENT, (full, attrs) => {
+    const token = attrs.match(/\bsgid=["']([^"']+)/)?.[1];
+    try {
+      const id = unverifiedUserGid(token);
+      const user = id && get("SELECT * FROM users WHERE id=?", Number(id));
+      if (user)
+        return `<span class="mention" data-user-id="${user.id}"><a href="/users/${user.id}">${escape(user.name)}</a></span>`;
+    } catch {}
+    const attributes = attachmentAttributes(full),
+      blob = attachedBlob(attributes);
+    if (blob) {
+      const url = blobUrl(blob),
+        filename = escape(blob.filename);
+      if ((blob.content_type || "").startsWith("image/"))
+        return `<figure class="attachment attachment--preview"><a href="${url}"><img src="${representationUrl(blob)}" alt="${filename}"></a>${attributes.caption ? "<figcaption>" + escape(attributes.caption) + "</figcaption>" : ""}</figure>`;
+      return `<a href="${url}?disposition=attachment">${filename}</a>`;
+    }
+    return "";
+  });
 }
 
 export function messagePlainText(messageId, body = "") {
