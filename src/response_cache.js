@@ -85,7 +85,12 @@ export class ResponseCache {
   }
 
   set(key, epoch, page) {
-    if (epoch !== this.#epoch || page.bytes.length > this.maxEntry) return;
+    if (
+      epoch !== this.#epoch ||
+      page.bytes.length > this.maxEntry ||
+      key.length > 8192
+    )
+      return;
     const replaced = this.#entries.get(key);
     if (replaced) this.#drop(key, replaced);
     page.key = key;
@@ -140,8 +145,10 @@ export class ResponseCache {
 }
 
 export function budgetFromEnv(value) {
-  const mb = value === undefined || value === "" ? NaN : Number(value);
-  return Math.floor((Number.isFinite(mb) && mb >= 0 ? mb : 32) * 1024 * 1024);
+  const mb = value === undefined || value === "" ? 64 : Number(value);
+  return Math.floor(
+    (Number.isFinite(mb) && mb > 0 ? Math.min(mb, 1024) : 0) * 1024 * 1024,
+  );
 }
 
 export const responseCache = new ResponseCache(
@@ -219,6 +226,10 @@ export function pageKey(req, tag) {
     req.format ?? "",
     req.headers["turbo-frame"] ?? "",
     req.headers.accept ?? "",
+    req.headers.origin ?? "",
+    req.headers["user-agent"] ?? "",
+    req.headers.cookie ?? "",
+    req.currentSession?.id ?? 0,
     req.user?.id ?? 0,
     req.authenticatedByBot ? 1 : 0,
     req.session?.last_room_id ?? "",
@@ -342,13 +353,20 @@ function renderPage(req, produce) {
 }
 
 export function sendCachedPage(req, res, tag, produce, cache = responseCache) {
-  if (req.method !== "GET" || !cache.budget || hasBody(req)) {
+  if (
+    !["GET", "HEAD"].includes(req.method) ||
+    !cache.budget ||
+    hasBody(req) ||
+    req.session?.flash ||
+    req.authenticatedByBot
+  ) {
     const html = produce();
     return html === undefined ? undefined : res.type(htmlType).send(html);
   }
   const epoch = req.pageEpoch ?? pageEpoch();
   const key = pageKey(req, tag);
-  const cached = cache.get(key, epoch);
+  // A commit during authentication or authorization must not promote old reads to a newer epoch.
+  const cached = pageEpoch() === epoch ? cache.get(key, epoch) : undefined;
   let chunks;
   if (cached?.epoch === epoch) return sendPage(req, res, cached);
   if (cached) {
@@ -379,8 +397,13 @@ export function sendCachedPage(req, res, tag, produce, cache = responseCache) {
     bytes,
   );
   if (
+    req.method === "GET" &&
     res.statusCode === 200 &&
     !res.getHeader("Set-Cookie") &&
+    !res.getHeader("Content-Encoding") &&
+    !/\b(?:no-store|no-transform)\b/i.test(
+      res.getHeader("Cache-Control") || "",
+    ) &&
     middlewareRowsCurrent(req)
   ) {
     const deps = req.pageDeps;

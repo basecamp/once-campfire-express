@@ -25,6 +25,7 @@ import { cachedAssets, SECURITY_HEADERS } from "./static_responses.js";
 import { registerOpengraph } from "./opengraph.js";
 import { allowLogin } from "./rate_limit.js";
 import { routeTable } from "./router.js";
+import { beginPage, responseCache } from "./response_cache.js";
 
 const BODY_LIMIT = 5 * 1024 * 1024;
 const DISK_BODY_LIMIT = 100 * 1024 * 1024;
@@ -53,6 +54,8 @@ export function authenticateCookies(header, cookies = parseCookies(header)) {
   }
 }
 function loadSession(req) {
+  if (responseCache.budget && ["GET", "HEAD"].includes(req.method))
+    beginPage(req);
   validateQueryCacheForTurn();
   req.cookies = parseCookies(req.headers.cookie);
   req.session = {};
@@ -140,13 +143,23 @@ function writeSessionCookies(req, reply) {
       httpOnly: false,
     });
 }
+// Browser writes use fetch metadata; old token fields are accepted as inert input.
+export function requestOriginAllowed(req) {
+  if (["GET", "HEAD"].includes(req.method)) return true;
+  const origin = req.headers.origin;
+  if (origin !== undefined && origin !== req.protocol + "://" + req.host)
+    return false;
+  const site = req.headers["sec-fetch-site"];
+  if (site === "same-origin" || site === "same-site") return true;
+  return site === undefined && !req.secure && !req.forceSsl;
+}
 const BOT_MESSAGES = /^\/rooms\/\d+\/[^/]+\/messages(?:\/|$)/;
 function forbidden(req, reply) {
   if (getCached("SELECT id FROM bans WHERE ip_address=?", req.ip))
     return reply.sendStatus(403);
   if (req.authenticatedByBot && !BOT_MESSAGES.test(req.path))
     return reply.sendStatus(403);
-  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return;
+  if (["GET", "HEAD"].includes(req.method)) return;
   if (req.authenticatedByBot && BOT_MESSAGES.test(req.path)) return;
   if (
     req.method === "PUT" &&
@@ -161,16 +174,7 @@ function forbidden(req, reply) {
       if (p && typeof p === "object" && p.key) return;
     } catch {}
   }
-  const origin = req.headers.origin;
-  if (origin && origin !== req.protocol + "://" + req.headers.host)
-    return reply.sendStatus(422);
-  // Sec-Fetch-Site replaces Rails' per-request tokens so pages render identically until their
-  // content changes. Browsers omit the header only on plain HTTP (or when very old), where the
-  // SameSite=Lax session cookie and the Origin check above are the protection.
-  const site = req.headers["sec-fetch-site"];
-  if (site === "same-origin" || site === "same-site") return;
-  if (site === undefined && !req.secure) return;
-  return reply.sendStatus(422);
+  if (!requestOriginAllowed(req)) return reply.sendStatus(422);
 }
 const mediaType = (req) =>
   (req.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
@@ -315,6 +319,10 @@ export function createApp({ publicCache } = {}) {
       }),
   });
   decorate(app);
+  app.decorateRequest(
+    "forceSsl",
+    /^(?:true|1)$/i.test(process.env.FORCE_SSL || ""),
+  );
   app.removeAllContentTypeParsers();
   app.addContentTypeParser(
     "*",

@@ -458,6 +458,7 @@ test("the primary relays a worker's broadcast to every other worker", () => {
     sent.map(([id]) => id),
     [1, 2, 3],
   );
+});
 
 test("external membership revocation is checked on the next broadcast", async () => {
   const c = await subscribed(id());

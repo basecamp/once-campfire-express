@@ -35,11 +35,11 @@ with four hardware cores allocated to each app.
 
 | HTTP workload (requests/sec) | Rails | [Django](https://github.com/basecamp/once-campfire-django) | [Laravel](https://github.com/basecamp/once-campfire-laravel) | [Express](https://github.com/basecamp/once-campfire-express) | [Elixir](https://github.com/basecamp/once-campfire-elixir) | [Go](https://github.com/basecamp/once-campfire-go) | [Rust](https://github.com/basecamp/once-campfire-rust) | [C](https://github.com/basecamp/once-campfire-c) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Room page | 230 | 62 | 760 | 2,622 | 942 | 31,673 | 35,484 | 141,834 |
-| Messages page | 402 | 70 | 924 | 3,245 | 1,267 | 30,746 | 40,674 | 151,564 |
-| Sidebar | 468 | 229 | 1,383 | 34,938 | 2,515 | 18,586 | 34,479 | 159,850 |
-| Search | 399 | 118 | 1,135 | 6,613 | 1,814 | 29,765 | 34,432 | 155,456 |
-| Post a message | 248 | 112 | 498 | 2,088 | 1,400 | 9,073 | 8,998 | 7,460 |
+| Room page | 2,063 | 478 | 3,038 | 43,925 | 5,350 | 53,060 | 106,494 | 137,524 |
+| Messages page | 2,063 | 486 | 3,081 | 74,176 | 5,712 | 54,800 | 102,697 | 144,642 |
+| Sidebar | 2,545 | 601 | 3,832 | 94,322 | 5,949 | 59,144 | 120,294 | 152,002 |
+| Search | 2,528 | 594 | 3,710 | 82,937 | 5,848 | 60,509 | 121,378 | 149,487 |
+| Post a message | 234 | 112 | 577 | 2,098 | 1,278 | 9,021 | 8,037 | 7,530 |
 
 [Shared verification](https://github.com/basecamp/once-campfire-verification) · [Detailed results](https://github.com/basecamp/once-campfire-verification/blob/main/docs/performance-review.md).
 
@@ -65,11 +65,13 @@ with four hardware cores allocated to each app.
   static fallback where Express answered 404. Verified by `npm test` and a seed smoke run
   (single and cluster workers); not re-benchmarked.
 - CSRF: `Sec-Fetch-Site` replaces tokens. Writes accept `same-origin` and `same-site`,
-  reject `cross-site`, `none` and missing headers over HTTPS with 422, and retain the
-  `Origin` check. Plain HTTP accepts missing headers with `SameSite=Lax` cookies. Pages omit
+  reject `cross-site`, `none`, invalid values and missing headers over HTTPS with 422.
+  A provided Origin must match the effective origin, including its port; null and empty
+  Origins fail. Only GET and HEAD bypass the check. Plain HTTP accepts missing metadata
+  unless `FORCE_SSL=true` declares a TLS-only deployment, retaining `SameSite=Lax` cookies. Pages omit
   CSRF tags and fields; old tabs still work, but HTTPS forms require a browser that sends
   the header (Safari 16.4 or newer). Rails-issued sessions keep their `_csrf_token`; new
-  sessions get none. Bot-key message routes stay exempt. `assets/overrides/models/file_uploader.js`
+  sessions get none. Authenticated bot-key message routes and signed disk-upload capabilities retain their exemptions. `assets/overrides/models/file_uploader.js`
   drops the upload's `X-CSRF-Token` header, which read the removed meta tag.
 - Attached downloads and inline attachments recheck room membership; new draft uploads
   belong to their uploader. Legacy unattached signed drafts remain usable after sign-in.
@@ -95,8 +97,8 @@ with four hardware cores allocated to each app.
   `fresh_when @messages`).
 - Action Cable authorization is memoized for `CABLE_AUTH_TTL_MS` (default 1000).
   Every publication checks the database generation; local and external revocations invalidate the authorization memo immediately.
-- Whole-page response cache per worker (`CAMPFIRE_RESPONSE_CACHE_MB`, default 32, 0
-  disables) for GET HTML: room, permalink, messages page, sidebar, search, show-message.
+- Whole-page response cache per worker (`CAMPFIRE_RESPONSE_CACHE_MB`, default 64 MiB,
+  capped at 1024; 0 or invalid disables) for GET/HEAD HTML: room, permalink, messages page, sidebar, search, show-message.
   An entry is current for the DB epoch it was stored in. After any commit (any process) it is
   revalidated, like Rails cache keys: a few indexed reads of exactly what the page prints
   (viewer/account rows, logo, room row, involvement, direct members, sidebar rooms with
@@ -107,7 +109,10 @@ with four hardware cores allocated to each app.
   edited in the last 15 s (or under `CAMPFIRE_FROZEN_TIME`) is kept for its epoch only.
   `CAMPFIRE_CACHE_VERIFY=1` re-renders every revalidated hit, serves and counts the fresh
   page on a mismatch. Mention names stay as cached, like the fragment cache. Rails has no
-  equivalent; output is unchanged.
+  equivalent; output is unchanged. Session and access checks run on every request;
+  request variants (origin, user agent, cookie, session) stay separate and cookies and
+  security headers stay fresh. HEAD reuses GET bodies but never stores; flash-bearing
+  and bot-authenticated responses bypass the cache.
 - Large HTML is gzip, not brotli: spliced from cached deflate pieces (`CAMPFIRE_GZIP_CACHE_MB`,
   default 32) or built once per cached page. Digested assets are served from precompressed
   `.br`/`.gz` files built by `bin/build-assets.js`; the file set is read at startup.

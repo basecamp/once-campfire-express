@@ -78,18 +78,20 @@ branch needs fresh production Docker checks and re-measured benchmarks.
   static fallback where Express answered 404. Verified by `npm test` and a seed smoke run
   (single and cluster workers); not re-benchmarked.
 - CSRF: `Sec-Fetch-Site` replaces tokens. Writes accept `same-origin` and `same-site`,
-  reject `cross-site`, `none` and missing headers over HTTPS with 422, and retain the
-  `Origin` check. Plain HTTP accepts missing headers with `SameSite=Lax` cookies. Pages omit
+  reject `cross-site`, `none`, invalid values and missing headers over HTTPS with 422.
+  A provided Origin must match the effective origin, including its port; null and empty
+  Origins fail. Only GET and HEAD bypass the check. Plain HTTP accepts missing metadata
+  unless `FORCE_SSL=true` declares a TLS-only deployment, retaining `SameSite=Lax` cookies. Pages omit
   CSRF tags and fields; old tabs still work, but HTTPS forms require a browser that sends
   the header (Safari 16.4 or newer). Rails-issued sessions keep their `_csrf_token`; new
-  sessions get none. Bot-key message routes stay exempt. `assets/overrides/models/file_uploader.js`
+  sessions get none. Authenticated bot-key message routes and signed disk-upload capabilities retain their exemptions. `assets/overrides/models/file_uploader.js`
   drops the upload's `X-CSRF-Token` header, which read the removed meta tag.
   HTTPS is detected from `req.secure` (`X-Forwarded-Proto` only through `TRUSTED_PROXIES`);
-  the app has no `force_ssl` setting, so the Rust port's extra "app forces SSL" condition
-  has no counterpart. The 189 Rails CSRF vectors still test `validCsrf`/`maskCsrf`, which
+  `FORCE_SSL=true` also requires metadata for requests arriving over plain HTTP; it does
+  not configure TLS termination or redirects. The 189 Rails CSRF vectors still test `validCsrf`/`maskCsrf`, which
   requests no longer call.
-- Whole-page response cache per worker (`CAMPFIRE_RESPONSE_CACHE_MB`, default 32, 0
-  disables) for GET HTML: room, permalink, messages page, sidebar, search, show-message.
+- Whole-page response cache per worker (`CAMPFIRE_RESPONSE_CACHE_MB`, default 64 MiB,
+  capped at 1024; 0 or invalid disables) for GET/HEAD HTML: room, permalink, messages page, sidebar, search, show-message.
   An entry is current for the DB epoch it was stored in. After any commit (any process) it is
   revalidated, like Rails cache keys: a few indexed reads of exactly what the page prints
   (viewer/account rows, logo, room row, involvement, direct members, sidebar rooms with
@@ -100,7 +102,10 @@ branch needs fresh production Docker checks and re-measured benchmarks.
   edited in the last 15 s (or under `CAMPFIRE_FROZEN_TIME`) is kept for its epoch only.
   `CAMPFIRE_CACHE_VERIFY=1` re-renders every revalidated hit, serves and counts the fresh
   page on a mismatch. Mention names stay as cached, like the fragment cache. Rails has no
-  equivalent; output is unchanged.
+  equivalent; output is unchanged. Session and access checks run on every request;
+  request variants (origin, user agent, cookie, session) stay separate and cookies and
+  security headers stay fresh. HEAD reuses GET bodies but never stores; flash-bearing
+  and bot-authenticated responses bypass the cache.
   Verified in-process only: randomized domain/HTTP writes and a second SQLite connection,
   each cached page compared byte for byte with an uncached render. Assumes the system clock
   never steps back more than 15 s; not yet exercised across production cluster workers.

@@ -315,7 +315,7 @@ test("messages page: weak ETag, 304 on a hit, 204 never cached, search cached", 
   assert.equal((await counted(() => page(search))).hits, 1);
 });
 
-test("render runs once per key and epoch; non-200 and HEAD are not cached", async () => {
+test("render runs once per key and epoch; non-200 and HEAD misses are not cached", async () => {
   const { listenApp } = await import("./fastify_app.js");
   const cache = new ResponseCache(1 << 20);
   let renders = 0;
@@ -355,15 +355,15 @@ test("render runs once per key and epoch; non-200 and HEAD are not cached", asyn
     await fetchPage("/page");
     assert.equal(renders, 1);
     await fetchPage("/page", "HEAD");
-    assert.equal(renders, 2);
+    assert.equal(renders, 1);
     run("UPDATE accounts SET name=name");
     const changed = await fetchPage("/page");
-    assert.equal(renders, 3);
+    assert.equal(renders, 2);
     assert.equal(changed.body.toString(), html);
     await fetchPage("/created");
     const created = await fetchPage("/created");
     assert.equal(created.r.statusCode, 201);
-    assert.equal(renders, 5);
+    assert.equal(renders, 4);
   } finally {
     await new Promise((resolve) => local.close(resolve));
   }
@@ -405,14 +405,15 @@ test("the cache stays within its byte budget, gzip included", () => {
   assert.equal(cache.get("big", "e2"), undefined);
 });
 
-test("CAMPFIRE_RESPONSE_CACHE_MB clamps invalid and negative values to 32", () => {
+test("CAMPFIRE_RESPONSE_CACHE_MB defaults to 64MiB, supports off and bounds configuration", () => {
   const mb = 1024 * 1024;
-  assert.equal(budgetFromEnv(undefined), 32 * mb);
-  assert.equal(budgetFromEnv(""), 32 * mb);
-  assert.equal(budgetFromEnv("nope"), 32 * mb);
-  assert.equal(budgetFromEnv("-5"), 32 * mb);
+  assert.equal(budgetFromEnv(undefined), 64 * mb);
+  assert.equal(budgetFromEnv(""), 64 * mb);
+  assert.equal(budgetFromEnv("nope"), 0);
+  assert.equal(budgetFromEnv("-5"), 0);
   assert.equal(budgetFromEnv("0"), 0);
   assert.equal(budgetFromEnv("8"), 8 * mb);
+  assert.equal(budgetFromEnv("1000000000"), 1024 * mb);
 });
 
 test("message cache keys see a body change that keeps updated_at", () => {
@@ -466,4 +467,316 @@ test("message cache keys are stable across calls and see same-length edits", () 
     message.id,
   );
   assert.notEqual(messageCacheKeys([row])[0], first);
+});
+
+test("message cache keys follow updated_at, which every edit moves even in one frozen millisecond", () => {
+  const frozen = process.env.CAMPFIRE_FROZEN_TIME;
+  process.env.CAMPFIRE_FROZEN_TIME = "2026-01-02T03:04:05.678Z";
+  try {
+    const message = domain.createMessage(open.id, admin.id, "<p>aaaa</p>");
+    const key = () => messageCacheKeys([domain.messageById(message.id)])[0];
+    const first = key();
+    assert.equal(key(), first);
+    assert.match(
+      domain.messageById(message.id).updated_at,
+      /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{6}$/,
+    );
+    domain.updateMessage(domain.messageById(message.id), "<p>bbbb</p>");
+    const second = key();
+    assert.notEqual(second, first, "same-length edit in the same millisecond");
+    domain.updateMessage(domain.messageById(message.id), "<p>cccc</p>");
+    assert.notEqual(key(), second);
+    const third = key();
+    run(
+      "UPDATE action_text_rich_texts SET body=? WHERE record_type='Message' AND record_id=?",
+      "<p>dddd</p>",
+      message.id,
+    );
+    assert.notEqual(
+      key(),
+      third,
+      "a body write that keeps timestamps also changes the key",
+    );
+  } finally {
+    if (frozen === undefined) delete process.env.CAMPFIRE_FROZEN_TIME;
+    else process.env.CAMPFIRE_FROZEN_TIME = frozen;
+  }
+});
+
+test("cached responses never outlive session, user or room authorization", async () => {
+  const user = domain.createUser({
+    name: "Cache security",
+    email_address: "cache-security@example.test",
+    password: "password",
+  });
+  const t = now();
+  const room = Number(
+    run(
+      "INSERT INTO rooms(name,type,creator_id,created_at,updated_at) VALUES(?,?,?,?,?)",
+      "Cached private",
+      "Rooms::Closed",
+      user.id,
+      t,
+      t,
+    ).lastInsertRowid,
+  );
+  domain.grantMemberships(get("SELECT * FROM rooms WHERE id=?", room), [
+    user.id,
+  ]);
+  for (const token of ["cache-security-one", "cache-security-two"])
+    run(
+      "INSERT INTO sessions(user_id,token,created_at,updated_at,last_active_at) VALUES(?,?,?,?,?)",
+      user.id,
+      token,
+      t,
+      t,
+      t,
+    );
+  const one = sessionCookie("cache-security-one"),
+    two = sessionCookie("cache-security-two");
+  const path = `/rooms/${room}`;
+  const request = (cookie) => raw(path, { headers: { cookie } });
+  await request(one);
+  assert.equal((await counted(() => request(one))).hits, 1);
+  assert.equal(
+    (await counted(() => request(two))).misses,
+    1,
+    "Two sessions must have independent cache keys",
+  );
+  assert.equal((await counted(() => request(two))).hits, 1);
+  const expired =
+    "session_token=" +
+    encodeURIComponent(
+      rails.signCookie(
+        "session_token",
+        "cache-security-one",
+        new Date(Date.now() - 1000),
+      ),
+    );
+  assert.equal((await counted(() => request(expired))).hits, 0);
+  assert.equal((await request(expired)).response.statusCode, 302);
+  const foreign = openDatabase(databaseFile());
+  try {
+    foreign
+      .prepare("DELETE FROM sessions WHERE token=?")
+      .run("cache-security-one");
+    const revoked = await counted(() => request(one));
+    assert.equal(revoked.result.response.statusCode, 302);
+    assert.equal(revoked.hits, 0);
+    await request(two);
+    foreign
+      .prepare("DELETE FROM memberships WHERE room_id=? AND user_id=?")
+      .run(room, user.id);
+    const unreachable = await counted(() => request(two));
+    assert.equal(unreachable.result.response.statusCode, 302);
+    assert.equal(unreachable.hits, 0);
+    foreign.prepare("UPDATE users SET status=2 WHERE id=?").run(user.id);
+    assert.equal((await request(two)).response.statusCode, 302);
+  } finally {
+    foreign.close();
+  }
+});
+
+test("warm GET caches leave native Origin and Sec-Fetch-Site forgery checks active", async () => {
+  const path = `/rooms/${open.id}`;
+  await page(path);
+  await page(path);
+  for (const headers of [
+    { origin: "https://attacker.test" },
+    { "sec-fetch-site": "cross-site" },
+  ]) {
+    const rejected = await counted(() =>
+      raw(`${path}/messages`, {
+        method: "POST",
+        headers: {
+          cookie: adminCookie,
+          "content-type": "application/x-www-form-urlencoded",
+          ...headers,
+        },
+        body: "message%5Bbody%5D=forged-cache-message",
+      }),
+    );
+    assert.equal(rejected.result.response.statusCode, 422);
+    assert.equal(rejected.hits, 0);
+  }
+  assert.equal(
+    get(
+      "SELECT count(*) AS n FROM action_text_rich_texts WHERE body LIKE '%forged-cache-message%'",
+    ).n,
+    0,
+  );
+});
+
+test("keys separate cookies, Origin and User-Agent without unused token dimensions or page substitution", async () => {
+  const { pageKey } = await import("../src/response_cache.js");
+  const headers = { host: "cache.test" };
+  const req = {
+    protocol: "http",
+    originalUrl: "/searches?q=literal",
+    session: {},
+    headers,
+  };
+  const base = pageKey(req, "search");
+  for (const [header, value] of [
+    ["cookie", "_campfire_session=signed"],
+    ["origin", "https://other.test"],
+    ["user-agent", "Native user agent"],
+  ]) {
+    headers[header] = value;
+    assert.notEqual(pageKey(req, "search"), base);
+    delete headers[header];
+  }
+  req.csrfToken = "literal-csrf-token";
+  assert.equal(pageKey(req, "search"), base);
+  delete req.csrfToken;
+  req.session._csrf_token = "another-literal-token";
+  assert.equal(pageKey(req, "search"), base);
+  domain.createMessage(
+    open.id,
+    admin.id,
+    "<p>literal __csrf_token__ and csrf-token=original stay unchanged</p>",
+  );
+  const path = `/rooms/${open.id}`;
+  const first = await page(path),
+    hit = await counted(() => page(path));
+  assert.equal(hit.hits, 1);
+  assert.ok(hit.result.body.equals(first.body));
+  assert.ok(
+    hit.result.body
+      .toString()
+      .includes(
+        "literal __csrf_token__ and csrf-token=original stay unchanged",
+      ),
+  );
+});
+
+test("a commit between pre-authentication capture and rendering prevents hits and admission", async () => {
+  const { listenApp } = await import("./fastify_app.js");
+  const { beginPage } = await import("../src/response_cache.js");
+  const cache = new ResponseCache(1 << 20);
+  let renders = 0,
+    mutate = false;
+  const local = await listenApp((app) => {
+    app.addHook("preHandler", (req, res, done) => {
+      beginPage(req);
+      req.account = get("SELECT * FROM accounts ORDER BY id LIMIT 1");
+      if (mutate) run("UPDATE accounts SET name=name");
+      done();
+    });
+    app.get("/page", (req, res) =>
+      sendCachedPage(
+        req,
+        res,
+        "race",
+        () => {
+          renders++;
+          return "<!DOCTYPE html><p>captured before commit</p>";
+        },
+        cache,
+      ),
+    );
+  });
+  const request = () =>
+    fetch(`http://127.0.0.1:${local.address().port}/page`).then((res) =>
+      res.text(),
+    );
+  try {
+    await request();
+    await request();
+    assert.equal(renders, 1);
+    mutate = true;
+    await request();
+    assert.equal(renders, 2);
+    const after = cache.stats();
+    await request();
+    assert.equal(renders, 3);
+    assert.equal(cache.stats().hits, after.hits);
+  } finally {
+    await new Promise((resolve) => local.close(resolve));
+  }
+});
+
+test("flash-bearing pages bypass lookup and admission", async () => {
+  const { listenApp } = await import("./fastify_app.js");
+  const cache = new ResponseCache(1 << 20);
+  let renders = 0;
+  const local = await listenApp((app) =>
+    app.get("/page", (req, res) => {
+      req.account = get("SELECT * FROM accounts ORDER BY id LIMIT 1");
+      req.session = req.query.flash ? { flash: { notice: "only once" } } : {};
+      sendCachedPage(
+        req,
+        res,
+        "flash",
+        () => {
+          renders++;
+          return (
+            "<!DOCTYPE html><p>" +
+            (req.session.flash?.notice || "ordinary") +
+            "</p>"
+          );
+        },
+        cache,
+      );
+    }),
+  );
+  const request = (path) =>
+    fetch(`http://127.0.0.1:${local.address().port}${path}`).then((res) =>
+      res.text(),
+    );
+  try {
+    await request("/page");
+    await request("/page");
+    assert.equal(renders, 1);
+    const before = cache.stats();
+    assert.match(await request("/page?flash=1"), /only once/);
+    assert.match(await request("/page?flash=1"), /only once/);
+    assert.equal(cache.stats().entries, before.entries);
+    assert.match(await request("/page"), /ordinary/);
+    assert.equal(renders, 3);
+  } finally {
+    await new Promise((resolve) => local.close(resolve));
+  }
+});
+
+test("foreign edits without timestamps invalidate nested message fragments", async () => {
+  const message = domain.createMessage(
+    open.id,
+    member.id,
+    "<p>original nested body</p>",
+  );
+  const path = `/rooms/${open.id}`;
+  await page(path);
+  await page(path);
+  const foreign = openDatabase(databaseFile());
+  try {
+    foreign
+      .prepare(
+        "UPDATE action_text_rich_texts SET body=? WHERE record_type='Message' AND record_id=?",
+      )
+      .run("<p>foreign nested body</p>", message.id);
+    let fresh = await page(path);
+    assert.match(fresh.body.toString(), /foreign nested body/);
+    assert.doesNotMatch(fresh.body.toString(), /original nested body/);
+    foreign
+      .prepare("UPDATE users SET name=? WHERE id=?")
+      .run("Foreign fragment creator", member.id);
+    fresh = await page(path);
+    assert.match(fresh.body.toString(), /Foreign fragment creator/);
+    foreign
+      .prepare(
+        "INSERT INTO boosts(booster_id,content,created_at,message_id,updated_at) VALUES(?,?,?,?,?)",
+      )
+      .run(admin.id, "🍊", now(), message.id, now());
+    fresh = await page(path);
+    assert.match(fresh.body.toString(), /🍊/);
+    foreign
+      .prepare("UPDATE boosts SET content=? WHERE message_id=?")
+      .run("🍋", message.id);
+    fresh = await page(path);
+    assert.match(fresh.body.toString(), /🍋/);
+    assert.doesNotMatch(fresh.body.toString(), /🍊/);
+  } finally {
+    foreign.close();
+  }
 });

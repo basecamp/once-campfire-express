@@ -381,7 +381,7 @@ export function registerRoutes(app) {
         });
         return render(req, "room", {
           Room: roomData(room, req.user),
-          Messages: cachedMessages(rows, origin(req)),
+          Messages: cachedMessages(rows),
           LoadedAt: epoch(room.updated_at),
           Stream: rails.signStream(rails.stream(room)),
           Involvement: get(

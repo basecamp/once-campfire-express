@@ -313,6 +313,26 @@ test("writes are verified by Sec-Fetch-Site and Origin instead of tokens", async
       [{ "sec-fetch-site": "same-site" }, 201, "same-site"],
       [{ "sec-fetch-site": "same-origin", origin: base }, 201, "own origin"],
       [{}, 201, "missing header over plain HTTP"],
+      [
+        { "sec-fetch-site": "same-origin", origin: "null" },
+        422,
+        "opaque origin",
+      ],
+      [
+        { "sec-fetch-site": "same-origin", origin: "" },
+        422,
+        "empty provided origin",
+      ],
+      [
+        {
+          "x-forwarded-proto": "https",
+          "x-forwarded-host": "campfire.test:8443",
+          "sec-fetch-site": "same-origin",
+          origin: "https://campfire.test:8443",
+        },
+        201,
+        "trusted forwarded scheme and host preserve the effective origin",
+      ],
       [{ "sec-fetch-site": "cross-site" }, 422, "cross-site"],
       [{ "sec-fetch-site": "none" }, 422, "none"],
       [{ "sec-fetch-site": "bogus" }, 422, "unknown value"],
@@ -1000,6 +1020,50 @@ test("fastEtag is stable per body, weak, and differs between bodies", async () =
   assert.equal(fastEtag(a), fastEtag(Buffer.from(a)));
   assert.notEqual(fastEtag(a), fastEtag(b));
 });
+
+test("sidebar direct rows also invalidate on related-user writes", async () => {
+  const http = await httpSession(member, "sidebar-direct-session");
+  try {
+    const t = now();
+    const direct = get(
+      "SELECT * FROM rooms WHERE id=?",
+      run(
+        "INSERT INTO rooms(name,type,creator_id,created_at,updated_at) VALUES(NULL,'Rooms::Direct',?,?,?)",
+        member.id,
+        t,
+        t,
+      ).lastInsertRowid,
+    );
+    const peer = domain.createUser({
+      name: "Zed Peer",
+      email_address: "zed-peer@example.test",
+      password: "password",
+    });
+    domain.grantMemberships(direct, [member.id, peer.id]);
+    const sidebar = () => http.page("/users/me/sidebar");
+    assert.ok((await sidebar()).includes("Ping with</span>Zed</span>"));
+    run(
+      "UPDATE users SET name='Yann Peer',updated_at=? WHERE id=?",
+      now(),
+      peer.id,
+    );
+    assert.ok(
+      (await sidebar()).includes("Ping with</span>Yann</span>"),
+      "a rename invalidates the cached row",
+    );
+    domain.createMessage(direct.id, peer.id, "<p>hello</p>");
+    const html = await sidebar();
+    assert.ok(html.includes("Ping with</span>Yann</span>"));
+    assert.ok(
+      html.includes(
+        `class="direct unread" id="list_rooms_direct_${direct.id}"`,
+      ),
+    );
+  } finally {
+    await http.close();
+  }
+});
+
 test("a posted message answers with the same fragment it broadcasts and indexes it once", async () => {
   const { cachedMessages } = await import("../src/rendering.js");
   const http = await httpSession(admin, "turbo-post-session");
@@ -1163,7 +1227,7 @@ test("search finds sparse memberships behind newer inaccessible matches", () => 
 });
 
 test("transfer landing page loads the automatic submit controller without creating a session on GET", async () => {
-  const server = createServer(createApp());
+  const server = await createAppServer();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const before = get("SELECT COUNT(*) n FROM sessions").n;
   try {

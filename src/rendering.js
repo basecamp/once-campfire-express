@@ -317,17 +317,17 @@ export function messageCacheKeys(rows, origin = "") {
   );
   const boostVersions = new Map();
   for (const b of all(
-    `SELECT b.message_id,b.id,b.updated_at,u.name,u.updated_at AS booster_updated_at FROM boosts b JOIN users u ON u.id=b.booster_id WHERE b.message_id IN (${marks}) ORDER BY b.created_at`,
+    `SELECT b.message_id,b.id,b.updated_at,b.content,u.name,u.updated_at AS booster_updated_at FROM boosts b JOIN users u ON u.id=b.booster_id WHERE b.message_id IN (${marks}) ORDER BY b.created_at`,
     ...ids,
   ))
     boostVersions.set(
       b.message_id,
       (boostVersions.get(b.message_id) || "") +
-        `${b.id}-${b.updated_at}-${b.booster_updated_at}-${b.name},`,
+        `${b.id}-${b.updated_at}-${b.booster_updated_at}-${b.name}-${b.content},`,
     );
   // Rails keys on the message's updated_at alone. Timestamps have millisecond resolution here and
   // replaceAttachment does not touch the message, so the key also carries the rendered inputs
-  // themselves: body digest, attachment blob, creator/booster/room names and avatar versions, and
+  // themselves: body digest, attachment blob, boost contents, creator/booster/room names and avatar versions, and
   // origin because Permalink embeds the request host. Names of @mentioned users are not keyed,
   // matching Rails, whose cached fragment also keeps the old mention text until the message changes.
   return rows.map(
