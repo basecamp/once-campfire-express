@@ -43,8 +43,23 @@ with four hardware cores allocated to each app.
 
 [Shared verification](https://github.com/basecamp/once-campfire-verification) · [Detailed results](https://github.com/basecamp/once-campfire-verification/blob/main/docs/performance-review.md).
 
-This branch has not yet been re-measured on Express. Its earlier local numbers were taken
-on Fastify and do not apply; results will be added after a run with the shared harness.
+This branch (Express on Node 24) was measured locally with the shared harness
+(`once-campfire-verification` `8c75704`, every response validated and every acknowledged write
+audited): 16 clients, servers on four hardware threads, clients on four others, median of 3
+rounds with the range in parentheses. Express `main` and Rust ran on the same machine. These are
+not shared-verification results and are not comparable with the table above.
+
+| HTTP workload (requests/sec) | This branch | Express `main` `805d366` | Rust `2e392fe` |
+|---|---:|---:|---:|
+| Room page | 18,259 (18,183–18,789) | 18,841 (18,335–18,872) | 37,259 (35,938–37,690) |
+| Messages page | 29,361 (29,150–30,150) | 28,777 (28,205–29,397) | 36,259 (36,126–36,265) |
+| Sidebar | 37,174 (29,006–37,213) | 36,842 (36,529–37,009) | 41,532 (41,402–41,730) |
+| Search | 32,763 (26,297–33,707) | 32,746 (32,606–32,758) | 41,685 (41,667–41,797) |
+| Post a message | 1,444 (1,323–2,004) | 1,012 (956–1,549) | 3,727 (2,204–3,928) |
+
+Reads match `main` within noise: the read benchmark performs no concurrent writes, so revalidation
+is not exercised. Write throughput varies widely between rounds for every app and the ranges
+overlap, so the higher write median is not a clear gain.
 
 ## Known differences
 
