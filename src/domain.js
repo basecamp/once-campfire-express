@@ -234,7 +234,7 @@ export function createMessage(roomId, userId, body = "", clientId = null) {
       time,
     );
     reconcileEmbeds(Number(richText.lastInsertRowid), content, Number(userId));
-    // AUTOINCREMENT ids are never reused, so there is no stale index row to delete (Rails' create_in_index).
+    // A new AUTOINCREMENT message cannot have an existing search-index row.
     run(
       "INSERT INTO message_search_index(rowid,body) VALUES(?,?)",
       id,
