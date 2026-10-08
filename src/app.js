@@ -182,10 +182,25 @@ function precompressedAssets() {
     );
   };
 }
+// Browser writes use fetch metadata; old token fields are accepted as inert input.
+export function requestOriginAllowed(req) {
+  if (["GET", "HEAD"].includes(req.method)) return true;
+  const origin = req.headers.origin;
+  if (
+    origin !== undefined &&
+    origin !== req.protocol + "://" + (req.host ?? req.get("host"))
+  )
+    return false;
+  const site = req.headers["sec-fetch-site"];
+  if (site === "same-origin" || site === "same-site") return true;
+  return site === undefined && !req.secure && !req.app.get("force ssl");
+}
+
 export function createApp() {
   initialize();
   const app = express();
   app.disable("x-powered-by");
+  app.set("force ssl", /^(?:true|1)$/i.test(process.env.FORCE_SSL || ""));
   app.set("query parser", "extended");
   if (process.env.TRUSTED_PROXIES)
     app.set("trust proxy", process.env.TRUSTED_PROXIES.split(","));
@@ -258,7 +273,7 @@ export function createApp() {
       !/^\/rooms\/\d+\/[^/]+\/messages(?:\/|$)/.test(req.path)
     )
       return res.sendStatus(403);
-    if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+    if (["GET", "HEAD"].includes(req.method)) return next();
     if (
       req.authenticatedByBot &&
       /^\/rooms\/\d+\/[^/]+\/messages(?:\/|$)/.test(req.path)
@@ -277,15 +292,7 @@ export function createApp() {
         if (p && typeof p === "object" && p.key) return next();
       } catch {}
     }
-    const origin = req.headers.origin;
-    if (origin && origin !== req.protocol + "://" + req.get("host"))
-      return res.sendStatus(422);
-    // Sec-Fetch-Site replaces Rails' per-request tokens so pages render identically until their
-    // content changes. Browsers omit the header only on plain HTTP (or when very old), where the
-    // SameSite=Lax session cookie and the Origin check above are the protection.
-    const site = req.headers["sec-fetch-site"];
-    if (site === "same-origin" || site === "same-site") return next();
-    if (site === undefined && !req.secure) return next();
+    if (requestOriginAllowed(req)) return next();
     res.sendStatus(422);
   });
   app.post("/session", (req, res, next) =>

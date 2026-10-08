@@ -174,8 +174,6 @@ export function pageKey(req, tag) {
     req.get("user-agent") ?? "",
     req.get("cookie") ?? "",
     req.currentSession?.id ?? 0,
-    req.csrfToken ?? "",
-    req.session?._csrf_token ?? "",
     req.user?.id ?? 0,
     req.authenticatedByBot ? 1 : 0,
     req.session?.last_room_id ?? "",

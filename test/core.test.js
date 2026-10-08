@@ -313,6 +313,26 @@ test("writes are verified by Sec-Fetch-Site and Origin instead of tokens", async
       [{ "sec-fetch-site": "same-site" }, 201, "same-site"],
       [{ "sec-fetch-site": "same-origin", origin: base }, 201, "own origin"],
       [{}, 201, "missing header over plain HTTP"],
+      [
+        { "sec-fetch-site": "same-origin", origin: "null" },
+        422,
+        "opaque origin",
+      ],
+      [
+        { "sec-fetch-site": "same-origin", origin: "" },
+        422,
+        "empty provided origin",
+      ],
+      [
+        {
+          "x-forwarded-proto": "https",
+          "x-forwarded-host": "campfire.test:8443",
+          "sec-fetch-site": "same-origin",
+          origin: "https://campfire.test:8443",
+        },
+        201,
+        "trusted forwarded scheme and host preserve the effective origin",
+      ],
       [{ "sec-fetch-site": "cross-site" }, 422, "cross-site"],
       [{ "sec-fetch-site": "none" }, 422, "none"],
       [{ "sec-fetch-site": "bogus" }, 422, "unknown value"],

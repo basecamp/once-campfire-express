@@ -582,7 +582,7 @@ test("warm GET caches leave native Origin and Sec-Fetch-Site forgery checks acti
   );
 });
 
-test("keys separate cookies, Origin, User-Agent and literal CSRF state without substituting page text", async () => {
+test("keys separate cookies, Origin and User-Agent without unused token dimensions or page substitution", async () => {
   const { pageKey } = await import("../src/response_cache.js");
   const headers = { host: "cache.test" };
   const req = {
@@ -602,10 +602,10 @@ test("keys separate cookies, Origin, User-Agent and literal CSRF state without s
     delete headers[header];
   }
   req.csrfToken = "literal-csrf-token";
-  assert.notEqual(pageKey(req, "search"), base);
+  assert.equal(pageKey(req, "search"), base);
   delete req.csrfToken;
   req.session._csrf_token = "another-literal-token";
-  assert.notEqual(pageKey(req, "search"), base);
+  assert.equal(pageKey(req, "search"), base);
   domain.createMessage(
     open.id,
     admin.id,

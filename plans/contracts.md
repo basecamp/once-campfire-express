@@ -79,15 +79,17 @@ branch needs fresh production Docker checks and re-measured benchmarks.
   edit with identical length, head and tail can serve stale cached HTML (Rails keys on
   `updated_at` alone).
 - CSRF: `Sec-Fetch-Site` replaces tokens. Writes accept `same-origin` and `same-site`,
-  reject `cross-site`, `none` and missing headers over HTTPS with 422, and retain the
-  `Origin` check. Plain HTTP accepts missing headers with `SameSite=Lax` cookies. Pages omit
+  reject `cross-site`, `none`, invalid values and missing headers over HTTPS with 422.
+  A provided Origin must match the effective origin, including its port; null and empty
+  Origins fail. Only GET and HEAD bypass the check. Plain HTTP accepts missing metadata
+  unless `FORCE_SSL=true` declares a TLS-only deployment, retaining `SameSite=Lax` cookies. Pages omit
   CSRF tags and fields; old tabs still work, but HTTPS forms require a browser that sends
   the header (Safari 16.4 or newer). Rails-issued sessions keep their `_csrf_token`; new
-  sessions get none. Bot-key message routes stay exempt. `assets/overrides/models/file_uploader.js`
+  sessions get none. Authenticated bot-key message routes and signed disk-upload capabilities retain their exemptions. `assets/overrides/models/file_uploader.js`
   drops the upload's `X-CSRF-Token` header, which read the removed meta tag.
   HTTPS is detected from `req.secure` (`X-Forwarded-Proto` only through `TRUSTED_PROXIES`);
-  Express has no `force_ssl` setting, so the Rust port's extra "app forces SSL" condition
-  has no counterpart. The 189 Rails CSRF vectors still test `validCsrf`/`maskCsrf`, which
+  `FORCE_SSL=true` also requires metadata for requests arriving over plain HTTP; it does
+  not configure TLS termination or redirects. The 189 Rails CSRF vectors still test `validCsrf`/`maskCsrf`, which
   requests no longer call.
 - Whole-page response cache per worker (`CAMPFIRE_RESPONSE_CACHE_MB`, default 64 MiB,
   0 disables it) for room, permalink, messages, sidebar, search and show-message HTML.
