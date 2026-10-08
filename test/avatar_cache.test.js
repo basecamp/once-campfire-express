@@ -3,12 +3,12 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { request } from "node:http";
+import { createServer, request } from "node:http";
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "campfire-avatar-cache-"));
 process.env.DATABASE_PATH = path.join(root, "db.sqlite3");
 process.env.CAMPFIRE_STORAGE_PATH = root;
 process.env.SECRET_KEY_BASE = "avatar-cache-tests";
-const { createServer: createAppServer } = await import("../src/app.js");
+const { createApp } = await import("../src/app.js");
 const { run, now } = await import("../src/db.js");
 const { openDatabase } = await import("../src/sqlite.js");
 const { avatar } = await import("../src/rendering.js");
@@ -16,7 +16,7 @@ const { publicResponses } = await import("../src/static_responses.js");
 
 let server, base, foreign;
 before(async () => {
-  server = await createAppServer();
+  server = createServer(createApp());
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   base = `http://127.0.0.1:${server.address().port}`;
   foreign = openDatabase(process.env.DATABASE_PATH);

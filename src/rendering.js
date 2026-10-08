@@ -443,8 +443,8 @@ export function render(req, screen, extra = {}) {
           ? "sidebar"
           : screen,
     Title: "Campfire",
-    Frame: !!req.headers?.["turbo-frame"],
-    Origin: `${req.protocol || "http"}://${req.headers?.host || "localhost"}`,
+    Frame: !!req.get?.("Turbo-Frame"),
+    Origin: `${req.protocol || "http"}://${req.get?.("host") || "localhost"}`,
     Version: "once-campfire-express",
     VAPIDPublicKey: process.env.VAPID_PUBLIC_KEY || "",
     CustomStyles: safe(

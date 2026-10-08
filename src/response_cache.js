@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { db, writeEpoch } from "./db.js";
 import { messageWindowIds, searchMessageIds } from "./domain.js";
-import { fastEtag, htmlType, sendPage, splicedGzipCache } from "./gzip.js";
+import { fastEtag, sendPage, splicedGzipCache } from "./gzip.js";
 import { messageCacheKeys, renderChunks } from "./rendering.js";
 
 const OVERHEAD = 256;
@@ -220,14 +220,14 @@ export function pageKey(req, tag) {
   return JSON.stringify([
     tag,
     req.protocol,
-    req.headers.host ?? "",
+    req.get("host") ?? "",
     req.originalUrl,
     req.format ?? "",
-    req.headers["turbo-frame"] ?? "",
-    req.headers.accept ?? "",
-    req.headers.origin ?? "",
-    req.headers["user-agent"] ?? "",
-    req.headers.cookie ?? "",
+    req.get("turbo-frame") ?? "",
+    req.get("accept") ?? "",
+    req.get("origin") ?? "",
+    req.get("user-agent") ?? "",
+    req.get("cookie") ?? "",
     req.currentSession?.id ?? 0,
     req.user?.id ?? 0,
     req.authenticatedByBot ? 1 : 0,
@@ -326,7 +326,7 @@ const verifying = () => process.env.CAMPFIRE_CACHE_VERIFY === "1";
 // and the session middleware's writeHead hook run on every request.
 // A GET may carry a body (handlers read e.g. req.body.q as a fallback); the key has no body.
 const hasBody = (req) =>
-  req.uploads?.length > 0 ||
+  req.files?.length > 0 ||
   (req.body != null &&
     (typeof req.body === "object" && !Buffer.isBuffer(req.body)
       ? Object.keys(req.body).length > 0
@@ -346,7 +346,7 @@ export function sendCachedPage(req, res, tag, produce, cache = responseCache) {
     req.authenticatedByBot
   ) {
     const html = produce();
-    return html === undefined ? undefined : res.type(htmlType).send(html);
+    return html === undefined ? undefined : res.type("html").send(html);
   }
   const epoch = req.pageEpoch ?? pageEpoch();
   const key = pageKey(req, tag);
@@ -378,7 +378,7 @@ export function sendCachedPage(req, res, tag, produce, cache = responseCache) {
   const bytes = Buffer.concat(chunks);
   const page = new Page(
     chunks,
-    res.getHeader("ETag") || fastEtag(bytes),
+    res.get("ETag") || (req.app.enabled("etag") ? fastEtag(bytes) : undefined),
     bytes,
   );
   if (

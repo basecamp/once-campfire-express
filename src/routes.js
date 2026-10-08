@@ -48,18 +48,17 @@ import {
   purgeBlob,
 } from "./storage.js";
 import { enqueue } from "./jobs.js";
-import { htmlType, isFresh } from "./gzip.js";
 const token = () => randomBytes(18).toString("base64url");
 const messagesEtag = (keys) =>
   `W/"${createHash("sha1").update(keys.join("|")).digest("hex")}"`;
-const origin = (req) => `${req.protocol}://${req.headers.host}`;
+const origin = (req) => `${req.protocol}://${req.get("host")}`;
 export function value(req, group, key, fallback = "") {
   const result =
     req.body?.[group]?.[key] ?? req.body?.[`${group}[${key}]`] ?? fallback;
   return Array.isArray(result) ? result.at(-1) : result;
 }
 const send = (req, res, screen, data = {}) =>
-  res.type(htmlType).send(render(req, screen, data));
+  res.type("html").send(render(req, screen, data));
 const can = (user, row) => user.role === 1 || row.creator_id === user.id;
 function login(req, res, next) {
   if (!req.user) {
@@ -83,7 +82,7 @@ function startSession(req, user) {
     "INSERT INTO sessions(user_id,token,user_agent,ip_address,last_active_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
     user.id,
     t,
-    req.headers["user-agent"] || "",
+    req.get("user-agent") || "",
     req.ip || "",
     time,
     time,
@@ -92,7 +91,7 @@ function startSession(req, user) {
   req.user = user;
   req.newSessionToken = t;
 }
-const file = (req, name) => req.uploads?.find((f) => f.fieldname === name);
+const file = (req, name) => req.files?.find((f) => f.fieldname === name);
 function attachment(req) {
   return (
     file(req, "message[attachment]") ||
@@ -192,7 +191,7 @@ export function serializeMessage(m, req) {
 }
 const turbo = (res, action, target, body = "") =>
   res
-    .type("text/vnd.turbo-stream.html; charset=utf-8")
+    .type("text/vnd.turbo-stream.html")
     .send(
       `<turbo-stream action="${action}" target="${target}"><template>${body}</template></turbo-stream>`,
     );
@@ -232,7 +231,7 @@ export function registerRoutes(app) {
     )
       return res
         .status(401)
-        .type(htmlType)
+        .type("html")
         .send(
           render(req, "login", {
             Error: "Too many requests or unauthorized.",
@@ -436,7 +435,7 @@ export function registerRoutes(app) {
       const json =
         isBot ||
         req.format === "json" ||
-        req.type(["html", "json"]) === "json" ||
+        req.accepts(["html", "json"]) === "json" ||
         req.path.endsWith(".json");
       if (req.method === "GET") {
         if (req.path.endsWith("/edit")) {
@@ -476,8 +475,8 @@ export function registerRoutes(app) {
                   window: { room: room.id, before, after, around },
                 });
                 const keys = messageCacheKeys(rows);
-                res.header("ETag", messagesEtag(keys));
-                if (isFresh(req, res)) return void res.status(304).send();
+                res.set("ETag", messagesEtag(keys));
+                if (req.fresh) return void res.status(304).end();
                 return fragment("messages", {
                   Messages: cachedMessages(rows, keys),
                 });
@@ -485,7 +484,7 @@ export function registerRoutes(app) {
         const rows = message ? [message] : messagesForRoom(room.id, req.query);
         if (!rows.length) return res.sendStatus(204);
         if (isBot) {
-          res.header(
+          res.set(
             "X-Total-Count",
             String(
               get("SELECT count(*) AS n FROM messages WHERE room_id=?", room.id)
@@ -501,12 +500,12 @@ export function registerRoutes(app) {
               anchor.created_at,
             )
           )
-            res.header(
+            res.set(
               "Link",
               `<${origin(req)}/rooms/${room.id}/${req.params.botKey}/messages?${direction}=${anchor.id}>; rel="next"`,
             );
         }
-        return res.send(
+        return res.json(
           message
             ? serializeMessage(message, req)
             : rows.map((m) => serializeMessage(m, req)),
@@ -545,15 +544,15 @@ export function registerRoutes(app) {
         if (isBot)
           return res
             .status(201)
-            .header(
+            .set(
               "Location",
               `${origin(req)}/rooms/${room.id}/messages/${message.id}`,
             )
-            .send();
+            .end();
         if (json)
           return res
             .status(201)
-            .send(serializeMessage(messageById(message.id), req));
+            .json(serializeMessage(messageById(message.id), req));
         return turbo(
           res,
           "append",
@@ -578,7 +577,7 @@ export function registerRoutes(app) {
         for (const id of obsolete || []) enqueue("purge", { blob_id: id });
         publishMessage(message, "replace");
         return json
-          ? res.send(serializeMessage(message, req))
+          ? res.json(serializeMessage(message, req))
           : res.redirect(`/rooms/${room.id}/messages/${message.id}`);
       }
       if (req.method === "DELETE") {
@@ -595,7 +594,7 @@ export function registerRoutes(app) {
     const since = Number(req.query.since) || 0;
     const messages = refreshMessages(room.id, since);
     const rendered = messageData(messagesByIds(messages.map((m) => m.id)));
-    res.type("text/vnd.turbo-stream.html; charset=utf-8").send(
+    res.type("text/vnd.turbo-stream.html").send(
       messages
         .map((m, i) => {
           const action = epoch(m.created_at) > since ? "append" : "replace",
@@ -848,7 +847,7 @@ function registerBoosts(app) {
           `<turbo-stream action="append" target="boosts_message_${message.client_message_id}" maintain_scroll="true"><template>${fragment("boost", boost)}</template></turbo-stream>`,
         );
         if (bot)
-          return res.status(201).send({
+          return res.status(201).json({
             id,
             content,
             created_at: iso(time),
@@ -925,8 +924,8 @@ function registerUsers(app) {
     users = users
       .filter((u) => u.name.toLowerCase().includes(query))
       .slice(0, 20);
-    if (req.type(["html", "json"]) === "json")
-      return res.send(
+    if (req.accepts(["html", "json"]) === "json")
+      return res.json(
         users.map((u) => ({
           id: u.id,
           name: escape(u.name),
@@ -937,7 +936,7 @@ function registerUsers(app) {
           value: u.id,
         })),
       );
-    res.type(htmlType).send(
+    res.type("html").send(
       users
         .map((u) =>
           fragment("prompt-item", {

@@ -13,7 +13,7 @@ const { run, get, now, initialize, databaseFile } =
 const { openDatabase } = await import("../src/sqlite.js");
 const domain = await import("../src/domain.js");
 const rails = await import("../src/rails.js");
-const { createServer: createAppServer } = await import("../src/app.js");
+const { createApp } = await import("../src/app.js");
 const { messageCacheKeys } = await import("../src/rendering.js");
 const { fastEtag } = await import("../src/gzip.js");
 const { ResponseCache, responseCache, sendCachedPage, budgetFromEnv } =
@@ -75,7 +75,7 @@ before(async () => {
     );
   adminCookie = sessionCookie("admin-session");
   memberCookie = sessionCookie("member-session");
-  server = await createAppServer();
+  server = http.createServer(createApp());
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   port = server.address().port;
 });
@@ -316,28 +316,29 @@ test("messages page: weak ETag, 304 on a hit, 204 never cached, search cached", 
 });
 
 test("render runs once per key and epoch; non-200 and HEAD misses are not cached", async () => {
-  const { listenApp } = await import("./fastify_app.js");
+  const express = (await import("express")).default;
+  const app = express();
+  app.use((req, res, next) => {
+    req.account = get("SELECT * FROM accounts ORDER BY id LIMIT 1");
+    next();
+  });
   const cache = new ResponseCache(1 << 20);
   let renders = 0;
   const html = "<!DOCTYPE html><p>" + "x".repeat(4000) + "</p>";
-  const local = await listenApp((app) => {
-    app.addHook("preHandler", (req, res, done) => {
-      req.account = get("SELECT * FROM accounts ORDER BY id LIMIT 1");
-      done();
-    });
-    app.get("/page", (req, res) =>
-      sendCachedPage(req, res, "t", () => (renders++, html), cache),
-    );
-    app.get("/created", (req, res) =>
-      sendCachedPage(
-        req,
-        res,
-        "c",
-        () => (renders++, res.status(201), html),
-        cache,
-      ),
-    );
-  });
+  app.get("/page", (req, res) =>
+    sendCachedPage(req, res, "t", () => (renders++, html), cache),
+  );
+  app.get("/created", (req, res) =>
+    sendCachedPage(
+      req,
+      res,
+      "c",
+      () => (renders++, res.status(201), html),
+      cache,
+    ),
+  );
+  const local = http.createServer(app);
+  await new Promise((resolve) => local.listen(0, "127.0.0.1", resolve));
   const at = local.address().port;
   const fetchPage = (path, method = "GET") =>
     new Promise((resolve, reject) =>
@@ -636,7 +637,7 @@ test("keys separate cookies, Origin and User-Agent without unused token dimensio
     protocol: "http",
     originalUrl: "/searches?q=literal",
     session: {},
-    headers,
+    get: (name) => headers[name.toLowerCase()],
   };
   const base = pageKey(req, "search");
   for (const [header, value] of [
@@ -673,31 +674,32 @@ test("keys separate cookies, Origin and User-Agent without unused token dimensio
 });
 
 test("a commit between pre-authentication capture and rendering prevents hits and admission", async () => {
-  const { listenApp } = await import("./fastify_app.js");
+  const express = (await import("express")).default;
   const { beginPage } = await import("../src/response_cache.js");
   const cache = new ResponseCache(1 << 20);
   let renders = 0,
     mutate = false;
-  const local = await listenApp((app) => {
-    app.addHook("preHandler", (req, res, done) => {
-      beginPage(req);
-      req.account = get("SELECT * FROM accounts ORDER BY id LIMIT 1");
-      if (mutate) run("UPDATE accounts SET name=name");
-      done();
-    });
-    app.get("/page", (req, res) =>
-      sendCachedPage(
-        req,
-        res,
-        "race",
-        () => {
-          renders++;
-          return "<!DOCTYPE html><p>captured before commit</p>";
-        },
-        cache,
-      ),
-    );
+  const app = express();
+  app.use((req, res, next) => {
+    beginPage(req);
+    req.account = get("SELECT * FROM accounts ORDER BY id LIMIT 1");
+    if (mutate) run("UPDATE accounts SET name=name");
+    next();
   });
+  app.get("/page", (req, res) =>
+    sendCachedPage(
+      req,
+      res,
+      "race",
+      () => {
+        renders++;
+        return "<!DOCTYPE html><p>captured before commit</p>";
+      },
+      cache,
+    ),
+  );
+  const local = http.createServer(app);
+  await new Promise((resolve) => local.listen(0, "127.0.0.1", resolve));
   const request = () =>
     fetch(`http://127.0.0.1:${local.address().port}/page`).then((res) =>
       res.text(),
@@ -719,29 +721,30 @@ test("a commit between pre-authentication capture and rendering prevents hits an
 });
 
 test("flash-bearing pages bypass lookup and admission", async () => {
-  const { listenApp } = await import("./fastify_app.js");
+  const express = (await import("express")).default;
   const cache = new ResponseCache(1 << 20);
+  const app = express();
   let renders = 0;
-  const local = await listenApp((app) =>
-    app.get("/page", (req, res) => {
-      req.account = get("SELECT * FROM accounts ORDER BY id LIMIT 1");
-      req.session = req.query.flash ? { flash: { notice: "only once" } } : {};
-      sendCachedPage(
-        req,
-        res,
-        "flash",
-        () => {
-          renders++;
-          return (
-            "<!DOCTYPE html><p>" +
-            (req.session.flash?.notice || "ordinary") +
-            "</p>"
-          );
-        },
-        cache,
-      );
-    }),
-  );
+  app.get("/page", (req, res) => {
+    req.account = get("SELECT * FROM accounts ORDER BY id LIMIT 1");
+    req.session = req.query.flash ? { flash: { notice: "only once" } } : {};
+    sendCachedPage(
+      req,
+      res,
+      "flash",
+      () => {
+        renders++;
+        return (
+          "<!DOCTYPE html><p>" +
+          (req.session.flash?.notice || "ordinary") +
+          "</p>"
+        );
+      },
+      cache,
+    );
+  });
+  const local = http.createServer(app);
+  await new Promise((resolve) => local.listen(0, "127.0.0.1", resolve));
   const request = (path) =>
     fetch(`http://127.0.0.1:${local.address().port}${path}`).then((res) =>
       res.text(),

@@ -1,12 +1,11 @@
 import zlib from "node:zlib";
 import { randomBytes } from "node:crypto";
-import fresh from "fresh";
 
 // Spliced gzip (port of the Rust kit's deflater/splice.rs). A page is split at the
 // per-request values its caller names; every stable segment between them is deflated once
 // and cached, and each response is a gzip header, those pieces, small hand-encoded pieces
 // for the volatile values and a trailer with the body's CRC. Pages carry no per-request
-// values since CSRF tokens gave way to Sec-Fetch-Site, so finishBody() names none.
+// values since CSRF tokens gave way to Sec-Fetch-Site, so the middleware names none.
 
 const WINDOW = 32 * 1024;
 const HEADER = Buffer.from([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]);
@@ -325,8 +324,9 @@ export const splicedGzipCache = new SplicedGzip(
 export const gzipSpliced = (body, volatile) =>
   splicedGzipCache.gzip(body, volatile);
 
-// Normalizes a text/html Content-Type the way Express's res.send did for strings (lowercased
-// type and parameter names, parameters sorted, charset=utf-8), so cached and fresh pages agree.
+// What res.send does to a string body's Content-Type (Express's setCharset via
+// content-type: lowercased type and parameter names, parameters sorted), without importing
+// Express internals.
 function withUtf8Charset(type) {
   const [media, ...rest] = type.split(";");
   const parameters = rest
@@ -354,96 +354,66 @@ export const htmlType = withUtf8Charset("text/html; charset=utf-8");
 
 const bodyHash = (bytes) => zlib.crc32(bytes).toString(16);
 
-// Weak validator for bodies we send ourselves. Only has to be stable per body, so a fast
-// non-cryptographic hash does; the length makes collisions far less likely.
+// Weak validator for pages we render ourselves. Only has to be stable per body, so a fast
+// non-cryptographic hash replaces Express's SHA-1; the length makes collisions far less likely.
 export const fastEtag = (bytes) =>
   `W/"${bytes.length.toString(16)}-${bodyHash(bytes)}"`;
 
-export function vary(reply, field) {
-  const current = reply.getHeader("Vary");
-  if (!current) return void reply.header("Vary", field);
-  const fields = String(current)
-    .split(",")
-    .map((f) => f.trim().toLowerCase());
-  if (!fields.includes("*") && !fields.includes(field.toLowerCase()))
-    reply.header("Vary", `${current}, ${field}`);
-}
-
-// Whether a GET/HEAD 2xx answer with the reply's validators is fresh for the request.
-export function isFresh(req, reply) {
-  if (req.method !== "GET" && req.method !== "HEAD") return false;
-  const status = reply.statusCode;
-  if ((status < 200 || status >= 300) && status !== 304) return false;
-  return fresh(req.headers, {
-    etag: reply.getHeader("ETag"),
-    "last-modified": reply.getHeader("Last-Modified"),
-  });
-}
-
-const gzipAccepted = (req) => req.encodings(["gzip"]) === "gzip";
-
 // Sends an already rendered 200 HTML page ({ bytes, etag, gzip() }) with the headers, ETag,
-// freshness and encoding a fresh HTML string gets from finishBody(), but without re-encoding,
-// re-hashing or re-compressing the body.
-export function sendPage(req, reply, page) {
-  reply.header("Content-Type", htmlType);
-  if (page.etag && !reply.getHeader("ETag")) reply.header("ETag", page.etag);
+// freshness and encoding res.type("html").send(string) produces through splicedGzip(), but
+// without re-encoding, re-hashing or re-compressing the body.
+export function sendPage(req, res, page) {
+  res.set("Content-Type", htmlType);
+  if (page.etag && !res.get("ETag")) res.set("ETag", page.etag);
   if (
     req.method !== "GET" ||
     page.bytes.length < 1024 ||
-    reply.statusCode !== 200 ||
-    reply.getHeader("Content-Encoding") ||
-    noTransform.test(reply.getHeader("Cache-Control") || "") ||
-    isFresh(req, reply) ||
-    !gzipAccepted(req)
+    req.fresh ||
+    res.statusCode !== 200 ||
+    res.get("Content-Encoding") ||
+    noTransform.test(res.get("Cache-Control") || "") ||
+    !req.acceptsEncodings("gzip")
   )
-    return reply.send(page.bytes);
-  vary(reply, "Accept-Encoding");
-  reply.header("Content-Encoding", "gzip");
-  return reply.send(page.gzip());
+    return res.send(page.bytes);
+  res.vary("Accept-Encoding");
+  res.set("Content-Encoding", "gzip");
+  return res.send(page.gzip());
 }
 
-// The onSend step before @fastify/compress: gives GET/HEAD 2xx string and Buffer bodies an ETag
-// over the uncompressed bytes, answers 304 when the request is fresh, and encodes large 200
-// text/html strings with spliced gzip, whose Content-Encoding makes compression pass them through.
-export function finishBody(req, reply, payload, cache = splicedGzipCache) {
-  const method = req.method;
-  if (method !== "GET" && method !== "HEAD") return payload;
-  const string = typeof payload === "string";
-  if (!string && !Buffer.isBuffer(payload)) return payload;
-  const status = reply.statusCode;
-  if (status < 200 || status >= 300) return payload;
-  const encoded = reply.getHeader("Content-Encoding");
-  let bytes;
-  if (!encoded && !reply.getHeader("ETag"))
-    reply.header(
-      "ETag",
-      fastEtag((bytes = string ? Buffer.from(payload, "utf8") : payload)),
-    );
-  if (isFresh(req, reply)) {
-    reply.code(304);
-    for (const name of [
-      "Content-Type",
-      "Content-Length",
-      "Content-Encoding",
-      "Transfer-Encoding",
-    ])
-      reply.removeHeader(name);
-    return null;
-  }
-  if (!string || status !== 200 || encoded) return payload;
-  const type = reply.getHeader("Content-Type");
-  if (typeof type !== "string" || !/^text\/html\b/i.test(type)) return payload;
-  bytes ??= Buffer.from(payload, "utf8");
-  reply.header("Content-Type", withUtf8Charset(type));
-  if (
-    method === "HEAD" ||
-    bytes.length < 1024 ||
-    noTransform.test(reply.getHeader("Cache-Control") || "") ||
-    !gzipAccepted(req)
-  )
-    return bytes;
-  vary(reply, "Accept-Encoding");
-  reply.header("Content-Encoding", "gzip");
-  return cache.gzip(bytes);
+// Installed before compression(): it answers large 200 text/html string bodies itself and
+// sets Content-Encoding, which makes compression() pass them through untouched. ETag and
+// freshness follow res.send exactly, over the uncompressed body. HEAD gets the same ETag, uncompressed.
+export function splicedGzip(cache = splicedGzipCache) {
+  return (req, res, next) => {
+    if (req.method !== "GET" && req.method !== "HEAD") return next();
+    const send = res.send;
+    res.send = function (body) {
+      if (
+        typeof body !== "string" ||
+        this.statusCode !== 200 ||
+        this.get("Content-Encoding")
+      )
+        return send.call(this, body);
+      if (!this.get("Content-Type")) this.type("html");
+      const type = this.get("Content-Type");
+      if (typeof type !== "string" || !/^text\/html\b/i.test(type))
+        return send.call(this, body);
+      const bytes = Buffer.from(body, "utf8");
+      this.set("Content-Type", withUtf8Charset(type));
+      if (!this.get("ETag") && req.app.enabled("etag"))
+        this.set("ETag", fastEtag(bytes));
+      if (
+        req.method === "HEAD" ||
+        bytes.length < 1024 ||
+        req.fresh ||
+        noTransform.test(this.get("Cache-Control") || "") ||
+        !req.acceptsEncodings("gzip")
+      )
+        return send.call(this, bytes);
+      this.vary("Accept-Encoding");
+      this.set("Content-Encoding", "gzip");
+      return send.call(this, cache.gzip(bytes));
+    };
+    next();
+  };
 }

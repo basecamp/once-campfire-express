@@ -1,6 +1,6 @@
 # Compatibility and verification
 
-Native JavaScript/Fastify implementation (Express 5 until the Fastify move); immutable public Rails reference `659f957`.
+Native JavaScript/Express implementation; immutable public Rails reference `659f957`.
 Existing SQLite schema, original files, bcrypt credentials and Rails JSON cookies are
 the compatibility contract. Raw evidence stays ignored in `tmp/`.
 
@@ -9,7 +9,7 @@ the compatibility contract. Raw evidence stays ignored in `tmp/`.
 | Rails signing, encryption and CSRF | Independent Rails vectors verify PBKDF2 keys, signed/encrypted cookies, signed IDs including large integers, SGIDs, application verifiers, Turbo streams, session continuity, purpose/expiry/signature rejection and 189 CSRF cases. Bounded data-only Marshal fixtures come from Ruby. |
 | SQLite and messages | Real isolated databases test nested rollback, membership authorization, raw timestamp cursors, persisted writes, updates/deletion and FTS; independent HTTP checks compare actual stored records. |
 | Frontend | Independent browser checks cover live compose/edit/delete/boost, mentions, paging, search, private/direct rooms, image upload/lightbox, administration and fresh setup. |
-| Sessions | Independent original Rails server accepts this port's cookies and the port accepts Rails-issued cookies on shared disposable data (run under Express; cookie encryption and signing are unchanged by Fastify). |
+| Sessions | Independent original Rails server accepts Express-issued cookies and Express accepts Rails-issued cookies on shared disposable data. |
 | Action Cable | Real sockets verify native subscription delivery, forged stream rejection, membership revocation, logout revocation and multi-tab presence. Cross-worker production browser delivery is exercised. |
 | Storage and media | Actual 3840×2160 JPEG becomes 1200×675; real ffmpeg audio/video analysis and poppler PDF preview; Rails-issued signed transform accepted; direct upload checksum/range/owner/private-room checks and failed-media rollback. |
 | Benchmarks | Matched production images with identical ordered 40-room/40-page/13-search windows, zero timed request failures, every acknowledged write stored with rich text and FTS, and SQLite integrity checks. Two paced runs admit all 100 sockets and deliver all 30 messages to every connection. Raw output remains ignored. |
@@ -71,17 +71,6 @@ production image passed the shared route contracts and write audits in a local b
 - `WEB_WORKERS` defaults to `auto` (`os.availableParallelism()`, respecting cpusets). Cluster
   workers listen with `reusePort` on Linux (`REUSE_PORT=0` disables).
 - HTML ETags are `W/"<length>-<crc32>"`.
-- HTTP runs on Fastify 5 (`@fastify/static`, `@fastify/multipart`, `@fastify/compress`,
-  `@fastify/cookie`, `@fastify/accepts`; `qs` for query strings and form bodies) instead of
-  Express 5. Routes, statuses, redirects, cookies, CSRF, uploads and caching are functionally
-  unchanged; bytes are not: redirects carry no body, header names are lowercase, string
-  bodies without a type default to `text/plain`, and ETags of non-page bodies are
-  `W/"<length>-<crc32>"` instead of Express's SHA-1. A form's `_method` is honoured by
-  `src/router.js`, which also keeps Express's ordered `next()` fall-through between
-  same-shaped routes (`/rooms/:kind` before `/rooms/:roomId`). `/up//` gets 403 from the
-  static fallback where Express answered 404. Verified by `npm test` and a seed smoke run
-  (single and cluster workers), and by the production image passing the shared route contracts
-  and write audits in a local benchmark run (see README Benchmarks).
 - CSRF: `Sec-Fetch-Site` replaces tokens. Writes accept `same-origin` and `same-site`,
   reject `cross-site`, `none`, invalid values and missing headers over HTTPS with 422.
   A provided Origin must match the effective origin, including its port; null and empty
@@ -124,7 +113,7 @@ production image passed the shared route contracts and write audits in a local b
   `.br`/`.gz` files built by `bin/build-assets.js`; the file set is read at startup.
 - Public responses are kept in memory per worker (`CAMPFIRE_PUBLIC_CACHE_MB`, default 32, 0
   disables; LRU): each digested asset variant (identity/br/gzip) with prebuilt headers is answered
-  before Fastify, and avatar bodies are keyed by their ETag, which covers every body input
+  before Express, and avatar bodies are keyed by their ETag, which covers every body input
   (user id, name, role, `updated_at` and the avatar blob's id, key and checksum), so changes,
   including a foreign role change to bot that leaves `updated_at` alone, show on the next
   request that reaches the server; browsers keep their copy for the 30-minute `max-age`
@@ -132,8 +121,8 @@ production image passed the shared route contracts and write audits in a local b
   first request (served from disk meanwhile) and never re-read (files over half the budget
   are never read, and ones resized since startup never stored). Range, `If-Match`,
   `If-Unmodified-Since` and on-the-fly-compressed requests keep the file-serving chain. Status,
-  bytes and client-relevant headers match it (diffed over every asset and encoding by
-  `test/static_responses.test.js`; the 2,010-response seed capture predates Fastify).
+  headers and bytes match it (diffed over every asset and encoding, and 2,010 captured
+  responses on the seed).
 - `/up` answers before the session middleware, as Rails' health controller does: no
   `_campfire_session` cookie, ban check or `last_active_at` update. Matched paths, body and ETag
   are unchanged.

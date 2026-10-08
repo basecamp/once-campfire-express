@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { request } from "node:http";
+import { createServer, request } from "node:http";
 import { execFileSync } from "node:child_process";
+import express from "express";
 import sharp from "sharp";
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "express-public-"));
 process.env.DATABASE_PATH = path.join(root, "db.sqlite3");
@@ -13,8 +14,7 @@ process.env.SECRET_KEY_BASE = "public-responses-tests";
 const dir = "assets/generated/public/assets";
 if (!fs.existsSync("assets/generated/manifest.json"))
   execFileSync(process.execPath, ["bin/build-assets.js"], { stdio: "ignore" });
-const { createServer: createAppServer } = await import("../src/app.js");
-const { listenApp } = await import("./fastify_app.js");
+const { createApp } = await import("../src/app.js");
 const { run, now } = await import("../src/db.js");
 const { replaceAttachment, removeAttachment } =
   await import("../src/storage.js");
@@ -23,15 +23,16 @@ const { publicResponses, cachedAssets, responseCache } =
   await import("../src/static_responses.js");
 
 const servers = [];
-async function listen(server) {
+async function listen(app) {
+  const server = createServer(app);
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   servers.push(server);
   return `http://127.0.0.1:${server.address().port}`;
 }
 let fast, slow;
 before(async () => {
-  fast = await listen(await createAppServer());
-  slow = await listen(await createAppServer({ publicCache: responseCache(0) }));
+  fast = await listen(createApp());
+  slow = await listen(createApp({ publicCache: responseCache(0) }));
 });
 after(() => {
   for (const server of servers) {
@@ -91,29 +92,7 @@ const names = fs
       fs.statSync(path.join(dir, f)).isFile(),
   );
 
-// What a client acts on. Header order and case, and the Content-* headers @fastify/static leaves
-// on a 304, differ between the in-memory and the file-serving answers.
-const ESSENTIAL = {
-  200: [
-    "content-type",
-    "content-encoding",
-    "content-length",
-    "etag",
-    "last-modified",
-    "cache-control",
-    "vary",
-    "x-content-type-options",
-  ],
-  304: ["etag", "last-modified", "cache-control", "vary"],
-};
-const essentials = ({ status, headers, body }) => ({
-  status,
-  body,
-  headers: Object.fromEntries(
-    (ESSENTIAL[status] ?? []).map((name) => [name, headers[name]]),
-  ),
-});
-test("every digested asset answers from memory like the file-serving chain does", async () => {
+test("every digested asset answers from memory exactly as the file-serving chain does", async () => {
   assert.ok(names.length > 100);
   for (const name of names)
     for (const accept of [undefined, "br", "gzip"]) {
@@ -137,11 +116,7 @@ test("every digested asset answers from memory like the file-serving chain does"
           fetchRaw(slow, url, headers),
           fetchRaw(fast, url, headers),
         ]);
-        assert.deepEqual(
-          essentials(got),
-          essentials(want),
-          `${url} ${JSON.stringify(headers)}`,
-        );
+        assert.deepEqual(got, want, `${url} ${JSON.stringify(headers)}`);
       }
     }
 });
@@ -184,23 +159,10 @@ async function tinyAssets(sizes, budget) {
   for (const [name, size] of Object.entries(sizes))
     fs.writeFileSync(path.join(assets, name), Buffer.alloc(size, 97));
   const cache = responseCache(budget);
-  const served = cachedAssets(assets, cache);
-  const server = await listenApp(
-    (app) => {
-      app.addHook("onRequest", (req, reply, done) => {
-        if (served.hook(req, reply)) reply.hijack();
-        done();
-      });
-      app.setNotFoundHandler((req, reply) => reply.code(404).send());
-    },
-    { finish: false },
-  );
-  servers.push(server);
-  return {
-    assets,
-    cache,
-    base: `http://127.0.0.1:${server.address().port}`,
-  };
+  const app = express();
+  app.use(cachedAssets(assets, cache));
+  app.use((req, res) => res.sendStatus(404));
+  return { assets, cache, base: await listen(app) };
 }
 
 test("serves loaded assets from memory and evicts least recently used past the byte budget", async () => {
@@ -273,8 +235,7 @@ test("/up skips the session cookie and still negotiates html or json", async () 
     ["/up.json/", 404],
     ["/up.JSON", 404],
     ["/up.json.json", 404],
-    // @fastify/static refuses the empty segment with 403 where Express answered 404.
-    ["/up//", 403],
+    ["/up//", 404],
   ])
     assert.equal((await fetchRaw(fast, url)).status, status, url);
 });

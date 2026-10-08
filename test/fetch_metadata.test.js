@@ -39,7 +39,7 @@ test("fetch metadata method, origin, site and TLS matrix ignores token input", (
         protocol: "http",
         host: "campfire.test",
         secure: false,
-        forceSsl: false,
+        app: { get: () => false },
         body: { authenticity_token: "old-token" },
       };
       assert.equal(
@@ -55,7 +55,7 @@ test("fetch metadata method, origin, site and TLS matrix ignores token input", (
     protocol: "https",
     host: "campfire.test:8443",
     secure: true,
-    forceSsl: false,
+    app: { get: () => false },
   };
   assert.equal(requestOriginAllowed(req), false);
   req.headers = {
@@ -68,7 +68,7 @@ test("fetch metadata method, origin, site and TLS matrix ignores token input", (
   req.protocol = "http";
   req.secure = false;
   req.headers = {};
-  req.forceSsl = true;
+  req.app = { get: () => true };
   assert.equal(requestOriginAllowed(req), false);
   req.headers["sec-fetch-site"] = "same-site";
   assert.equal(requestOriginAllowed(req), true);

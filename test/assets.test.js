@@ -9,14 +9,14 @@ process.env.SECRET_KEY_BASE = "assets-tests";
 const dir = "assets/generated/public/assets";
 if (!fs.existsSync("assets/generated/manifest.json"))
   execFileSync(process.execPath, ["bin/build-assets.js"], { stdio: "ignore" });
-const { createServer: createAppServer } = await import("../src/app.js");
+const { createApp } = await import("../src/app.js");
 const css = fs
   .readdirSync(dir)
   .find((f) => f.endsWith(".css") && fs.existsSync(`${dir}/${f}.br`));
 const original = fs.readFileSync(`${dir}/${css}`);
 let server, base;
 before(async () => {
-  server = await createAppServer();
+  server = createServer(createApp());
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   base = `http://127.0.0.1:${server.address().port}`;
 });
@@ -73,7 +73,7 @@ for (const [encoding, decode] of [
       res.headers.get("cache-control"),
       "public, max-age=31536000, immutable",
     );
-    assert.match(res.headers.get("vary"), /accept-encoding/i);
+    assert.match(res.headers.get("vary"), /Accept-Encoding/);
     assert.ok(res.headers.get("etag"));
     assert.deepEqual(decode(Buffer.from(await res.arrayBuffer())), original);
   });

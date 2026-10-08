@@ -166,10 +166,10 @@ export function registerOpengraph(app) {
     try {
       const data = await fetchMetadata(req.body.url);
       return data.title && data.description
-        ? res.send(data)
-        : res.status(204).send();
+        ? res.json(data)
+        : res.status(204).end();
     } catch {
-      return res.status(204).send();
+      return res.status(204).end();
     }
   });
 }

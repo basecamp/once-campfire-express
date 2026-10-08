@@ -9,8 +9,7 @@ const { SplicedGzip, gzipSpliced, splicedGzipCache, fastEtag } =
 const { run, get, now, initialize } = await import("../src/db.js");
 const domain = await import("../src/domain.js");
 const rails = await import("../src/rails.js");
-const { createServer: createAppServer } = await import("../src/app.js");
-const { listenApp } = await import("./fastify_app.js");
+const { createApp } = await import("../src/app.js");
 const { responseCache } = await import("../src/response_cache.js");
 
 const token = (n) =>
@@ -275,7 +274,7 @@ function raw(port, path, { method = "GET", headers = {} } = {}) {
 }
 
 test("e: room pages are served as spliced gzip through the real app", async () => {
-  const server = await createAppServer();
+  const server = http.createServer(createApp());
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   const cookie =
@@ -369,21 +368,26 @@ test("e: room pages are served as spliced gzip through the real app", async () =
   }
 });
 
-test("finishBody keeps ETag, 304, HEAD and identity semantics", async () => {
+test("the middleware keeps Express ETag, 304, HEAD and identity semantics", async () => {
+  const express = (await import("express")).default;
+  const { splicedGzip } = await import("../src/gzip.js");
+  const app = express();
+  app.use(splicedGzip());
   const body = page("fixed-token", 20);
-  const html = "text/html; charset=utf-8";
-  const server = await listenApp((app) => {
-    app.get("/page", (req, res) => res.type(html).send(body));
-    app.get("/small", (req, res) => res.type(html).send("<p>small</p>"));
-    app.get("/json", (req, res) => res.send({ body }));
-    app.get("/created", (req, res) => res.status(201).type(html).send(body));
-    app.get("/no-transform", (req, res) =>
-      res.header("Cache-Control", "no-transform").type(html).send(body),
-    );
-    app.get("/typed", (req, res) =>
-      res.header("Content-Type", req.query.type).send(body),
-    );
+  app.get("/page", (req, res) => {
+    res.send(body);
   });
+  app.get("/small", (req, res) => res.send("<p>small</p>"));
+  app.get("/json", (req, res) => res.json({ body }));
+  app.get("/created", (req, res) => res.status(201).send(body));
+  app.get("/no-transform", (req, res) =>
+    res.set("Cache-Control", "no-transform").send(body),
+  );
+  app.get("/typed", (req, res) =>
+    res.set("Content-Type", req.query.type).send(body),
+  );
+  const server = http.createServer(app);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   const gzipHeaders = { "accept-encoding": "gzip" };
   try {
@@ -540,9 +544,12 @@ test("gzipChunks round trips any chunking and reuses pieces of unchanged chunks"
   );
 });
 
-test("sendPage answers like an HTML string through finishBody", async () => {
-  const { sendPage, htmlType } = await import("../src/gzip.js");
+test("sendPage answers like res.send(string) through the middleware", async () => {
+  const express = (await import("express")).default;
+  const { splicedGzip, sendPage } = await import("../src/gzip.js");
   const gzip = new SplicedGzip(32 << 20);
+  const app = express();
+  app.use(splicedGzip());
   const body = page("fixed-token", 20);
   const small = "<p>small</p>";
   const pageOf = (html) => {
@@ -553,12 +560,12 @@ test("sendPage answers like an HTML string through finishBody", async () => {
       gzip: () => gzip.gzipChunks([bytes]),
     };
   };
-  const server = await listenApp((app) => {
-    app.get("/string", (req, res) => res.type(htmlType).send(body));
-    app.get("/page", (req, res) => sendPage(req, res, pageOf(body)));
-    app.get("/small-string", (req, res) => res.type(htmlType).send(small));
-    app.get("/small-page", (req, res) => sendPage(req, res, pageOf(small)));
-  });
+  app.get("/string", (req, res) => res.type("html").send(body));
+  app.get("/page", (req, res) => sendPage(req, res, pageOf(body)));
+  app.get("/small-string", (req, res) => res.type("html").send(small));
+  app.get("/small-page", (req, res) => sendPage(req, res, pageOf(small)));
+  const server = http.createServer(app);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   const relevant = (headers) => ({
     type: headers["content-type"],
