@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import bcrypt from "bcryptjs";
-import { all, get, run, transaction, now, onCommit, touch } from "./db.js";
+import { all, get, run, transaction, now, onCommit } from "./db.js";
 import {
   sanitize,
   plainText,
@@ -15,7 +15,7 @@ export const userById = (id) =>
   get("SELECT * FROM users WHERE id=?", Number(id));
 export const roomsForUser = (id) =>
   all(
-    "SELECT r.*,m.involvement,m.unread_at,m.id AS membership_id,m.updated_at AS membership_updated_at FROM rooms r JOIN memberships m ON m.room_id=r.id WHERE m.user_id=? ORDER BY lower(r.name)",
+    "SELECT r.*,m.involvement,m.unread_at FROM rooms r JOIN memberships m ON m.room_id=r.id WHERE m.user_id=? ORDER BY lower(r.name)",
     Number(id),
   );
 export const roomForUser = (user, id) =>
@@ -24,16 +24,9 @@ export const roomForUser = (user, id) =>
     Number(user?.id ?? user),
     Number(id),
   );
-const presentationColumns =
-  "m.*,u.name AS creator_name,u.bio AS creator_bio,u.updated_at AS creator_updated_at,r.name AS room_name,r.type AS room_type";
-const presentationJoins =
-  "JOIN users u ON u.id=m.creator_id JOIN rooms r ON r.id=m.room_id";
-export const presentation = `SELECT ${presentationColumns} FROM messages m ${presentationJoins}`;
-// Pages the messages first and joins the 40 survivors. Equivalent to joining first because
-// messages.creator_id and room_id are NOT NULL foreign keys (foreign_keys=ON), so the inner
-// joins never drop a row.
-export const pagedPresentation = (clauses, direction) =>
-  `SELECT ${presentationColumns} FROM (SELECT * FROM messages WHERE ${clauses} ORDER BY created_at ${direction}, id ${direction} LIMIT 40) m ${presentationJoins} ORDER BY m.created_at ${direction}, m.id ${direction}`;
+export const presentation =
+  "SELECT m.*,u.name AS creator_name,u.bio AS creator_bio,u.updated_at AS creator_updated_at,r.name AS room_name,r.type AS room_type FROM messages m JOIN users u ON u.id=m.creator_id JOIN rooms r ON r.id=m.room_id";
+export const PAGE_SIZE = 40;
 export const messageById = (id) =>
   get(presentation + " WHERE m.id=?", Number(id));
 export function messagesByIds(ids) {
@@ -66,32 +59,11 @@ export function refreshMessages(roomId, since) {
 // Read newest FTS matches without sorting the entire history. Sparse memberships
 // fall back after a bounded probe; hydration rechecks the current membership.
 export function searchMessages(user, query) {
-  const terms = query
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((word) => '"' + word.replaceAll('"', '""') + '"')
-    .join(" ");
-  if (!terms) return [];
-  const probe = all(
-    "SELECT m.id, ms.user_id IS NOT NULL AS reachable FROM message_search_index idx JOIN messages m ON m.id=idx.rowid LEFT JOIN memberships ms ON ms.room_id=m.room_id AND ms.user_id=? WHERE idx.body MATCH ? ORDER BY idx.rowid DESC LIMIT 1000",
-    user.id,
-    terms,
-  );
-  let ids = probe
-    .filter((row) => row.reachable)
-    .slice(0, 100)
-    .map((row) => row.id);
-  if (ids.length < 100 && probe.length === 1000)
-    ids = all(
-      "SELECT m.id FROM messages m JOIN message_search_index idx ON idx.rowid=m.id JOIN memberships ms ON ms.room_id=m.room_id WHERE ms.user_id=? AND idx.body MATCH ? ORDER BY m.id DESC LIMIT 100",
-      user.id,
-      terms,
-    ).map((row) => row.id);
   return all(
     presentation +
       " JOIN memberships ms ON ms.room_id=m.room_id WHERE ms.user_id=? AND m.id IN (SELECT value FROM json_each(?)) ORDER BY m.id",
     user.id,
-    JSON.stringify(ids),
+    JSON.stringify(searchMessageIds(user.id, query)),
   );
 }
 
@@ -105,32 +77,38 @@ export function directMembers(roomIds) {
       members.get(row.member_room_id).push(row);
   return members;
 }
-export function messagesForRoom(id, { before, after, around } = {}) {
+// Pages ids alone, which index_messages_on_room_id_and_created_at covers, and joins only the
+// shown messages. Equivalent to joining first because messages.creator_id and room_id are NOT
+// NULL foreign keys (foreign_keys=ON), so the inner joins never drop a row. The response cache
+// re-runs this selection to revalidate a page, so every window a page shows comes from here.
+// Rails orders the around= halves by created_at alone; ties are broken by id like the others.
+const pageIds = (clauses, direction, ...args) =>
+  all(
+    `SELECT id FROM messages WHERE ${clauses} ORDER BY created_at ${direction}, id ${direction} LIMIT ${PAGE_SIZE}`,
+    ...args,
+  ).map((row) => row.id);
+export function messageWindowIds(id, { before, after, around } = {}) {
+  const room = Number(id);
   if (around) {
     const pivot = get(
-      "SELECT * FROM messages WHERE id=? AND room_id=?",
+      "SELECT id,created_at FROM messages WHERE id=? AND room_id=?",
       Number(around),
-      Number(id),
+      room,
     );
-    if (!pivot) return messagesForRoom(id);
+    if (!pivot) return messageWindowIds(room);
     return [
-      ...all(
-        presentation +
-          " WHERE m.room_id=? AND m.created_at<? ORDER BY m.created_at DESC LIMIT 40",
-        Number(id),
+      ...pageIds(
+        "room_id=? AND created_at<?",
+        "DESC",
+        room,
         pivot.created_at,
       ).reverse(),
-      messageById(pivot.id),
-      ...all(
-        presentation +
-          " WHERE m.room_id=? AND m.created_at>? ORDER BY m.created_at ASC LIMIT 40",
-        Number(id),
-        pivot.created_at,
-      ),
+      pivot.id,
+      ...pageIds("room_id=? AND created_at>?", "ASC", room, pivot.created_at),
     ];
   }
   let clauses = "room_id=?",
-    args = [Number(id)];
+    args = [room];
   for (const [anchor, operator] of [
     [before, "<"],
     [after, ">"],
@@ -139,15 +117,42 @@ export function messagesForRoom(id, { before, after, around } = {}) {
       const pivot = get(
         "SELECT created_at FROM messages WHERE id=? AND room_id=?",
         Number(anchor),
-        Number(id),
+        room,
       );
       if (!pivot)
         throw Object.assign(new Error("Message not found"), { status: 404 });
       clauses += ` AND created_at${operator}?`;
       args.push(pivot.created_at);
     }
-  const rows = all(pagedPresentation(clauses, after ? "ASC" : "DESC"), ...args);
-  return after ? rows : rows.reverse();
+  const ids = pageIds(clauses, after ? "ASC" : "DESC", ...args);
+  return after ? ids : ids.reverse();
+}
+export const messagesForRoom = (id, window) =>
+  messagesByIds(messageWindowIds(id, window));
+// Read newest FTS matches without sorting the entire history. Sparse memberships
+// fall back after a bounded probe; hydration rechecks the current membership.
+export function searchMessageIds(userId, query) {
+  const terms = (query || "")
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => '"' + word.replaceAll('"', '""') + '"')
+    .join(" ");
+  if (!terms) return [];
+  const probe = all(
+    "SELECT m.id, ms.user_id IS NOT NULL AS reachable FROM message_search_index idx JOIN messages m ON m.id=idx.rowid LEFT JOIN memberships ms ON ms.room_id=m.room_id AND ms.user_id=? WHERE idx.body MATCH ? ORDER BY idx.rowid DESC LIMIT 1000",
+    Number(userId),
+    terms,
+  );
+  const ids = probe
+    .filter((row) => row.reachable)
+    .slice(0, 100)
+    .map((row) => row.id);
+  if (ids.length === 100 || probe.length < 1000) return ids;
+  return all(
+    "SELECT m.id FROM messages m JOIN message_search_index idx ON idx.rowid=m.id JOIN memberships ms ON ms.room_id=m.room_id WHERE ms.user_id=? AND idx.body MATCH ? ORDER BY m.id DESC LIMIT 100",
+    Number(userId),
+    terms,
+  ).map((row) => row.id);
 }
 export function grantMemberships(room, userIds) {
   const timestamp = now();
@@ -284,7 +289,7 @@ export function updateMessage(
       );
       indexMessage(message.id, content, attachment?.filename || "");
     }
-    touch("messages", message.id);
+    run("UPDATE messages SET updated_at=? WHERE id=?", time, message.id);
     run("UPDATE rooms SET updated_at=? WHERE id=?", time, message.room_id);
   });
   return messageById(message.id);
@@ -331,6 +336,7 @@ export function deleteMessage(message, { broadcast = true } = {}) {
     if (broadcast) publishMessage(message, "remove");
   });
 }
+// Returns the broadcast fragment so the poster's own response reuses it instead of rendering twice.
 export function publishMessage(message, action = "append") {
   const room = get("SELECT * FROM rooms WHERE id=?", message.room_id);
   if (!room) return;

@@ -1,8 +1,6 @@
 import express from "express";
 import compression from "compression";
 import { splicedGzip } from "./gzip.js";
-import { frontCacheMiddleware } from "./front_cache.js";
-import { beginPage, responseCache } from "./response_cache.js";
 import multer from "multer";
 import path from "node:path";
 import fs from "node:fs";
@@ -18,9 +16,11 @@ import {
 } from "./db.js";
 import { registerRoutes } from "./routes.js";
 import { registerStorage } from "./storage.js";
-import { registerPublic } from "./public.js";
+import { registerPublic, healthCheck } from "./public.js";
+import { cachedAssets, SECURITY_HEADERS } from "./static_responses.js";
 import { registerOpengraph } from "./opengraph.js";
 import { allowLogin } from "./rate_limit.js";
+import { beginPage, responseCache } from "./response_cache.js";
 
 export function parseCookies(header = "") {
   const result = Object.create(null);
@@ -195,26 +195,30 @@ export function requestOriginAllowed(req) {
   if (site === "same-origin" || site === "same-site") return true;
   return site === undefined && !req.secure && !req.app.get("force ssl");
 }
-
-export function createApp() {
+export function createApp({ publicCache } = {}) {
   initialize();
   const app = express();
   app.disable("x-powered-by");
-  app.set("force ssl", /^(?:true|1)$/i.test(process.env.FORCE_SSL || ""));
   app.set("query parser", "extended");
+  app.set("force ssl", /^(?:true|1)$/i.test(process.env.FORCE_SSL || ""));
   if (process.env.TRUSTED_PROXIES)
     app.set("trust proxy", process.env.TRUSTED_PROXIES.split(","));
-  app.use(frontCacheMiddleware());
+  const assets = cachedAssets(assetsRoot(), publicCache);
+  // Answering before Express decorates req/res and walks its router adds ~20% asset throughput.
+  const handle = app.handle;
+  app.handle = function (req, res, callback) {
+    if (!assets.direct(req, res)) handle.call(this, req, res, callback);
+  };
+  app.use(assets);
   app.use((req, res, next) => {
-    res.set({
-      "X-Content-Type-Options": "nosniff",
-      "X-Frame-Options": "SAMEORIGIN",
-      "Referrer-Policy": "strict-origin-when-cross-origin",
-    });
+    res.set(SECURITY_HEADERS);
     next();
   });
   app.use(splicedGzip());
   app.use(compression({ threshold: 1024, level: 6 }));
+  // Like Rails' health controller: no session cookie, ban check or last_active_at update. Matches
+  // exactly what "/up" matched after the format-stripping rewrite below.
+  app.get(/^\/[uU][pP]\/?(?:\.json|\.turbo_stream)?$/, healthCheck);
   app.use("/assets", precompressedAssets());
   app.use(
     "/assets",

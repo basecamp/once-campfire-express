@@ -1,9 +1,9 @@
 import { Eta } from "eta";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { all, get, renderEpoch } from "./db.js";
+import { all, get } from "./db.js";
 import * as rails from "./rails.js";
-import { escape, plainText, renderBody } from "./richtext.js";
+import { embeddedBlobIds, escape, plainText, renderBody } from "./richtext.js";
 import { blobUrl, representationUrl } from "./storage.js";
 import { FragmentCache } from "./fragment_cache.js";
 // Output keeps nunjucks autoescape semantics byte for byte: null and undefined print nothing,
@@ -19,6 +19,17 @@ class SafeString {
   }
 }
 export const safe = (value) => new SafeString(value || "");
+// Message HTML stored with its UTF-8 bytes. Inside renderChunks() it prints a marker instead,
+// and the page is assembled around the stored bytes rather than encoding them again.
+class FragmentHtml extends SafeString {
+  constructor({ text, bytes }) {
+    super(text);
+    this.bytes = bytes;
+  }
+}
+// NUL never occurs in rendered HTML text; the random part keeps user input from forging a marker.
+const MARK = `\u0000${randomBytes(6).toString("hex")}:`;
+let spliced = null;
 const escapes = {
   "&": "&amp;",
   '"': "&quot;",
@@ -29,7 +40,11 @@ const escapes = {
 };
 function escapeOutput(value) {
   if (value == null) return "";
-  if (value instanceof SafeString) return value.val;
+  if (value instanceof SafeString) {
+    if (!spliced || !(value instanceof FragmentHtml)) return value.val;
+    spliced.push(value.bytes);
+    return `${MARK}${spliced.length - 1}\u0000`;
+  }
   return String(value).replace(/[&"'<>\\]/g, (char) => escapes[char]);
 }
 const templateDir = new URL("../templates/eta/", import.meta.url);
@@ -141,7 +156,7 @@ export function messageData(messages) {
     ).map((r) => [r.record_id, r]),
   );
   const boosts = all(
-    `SELECT b.*,u.name,u.bio,u.updated_at AS booster_updated_at FROM boosts b JOIN users u ON u.id=b.booster_id WHERE b.message_id IN (${placeholders}) ORDER BY b.created_at`,
+    `SELECT b.*,u.name,u.bio,u.updated_at AS booster_updated_at FROM boosts b JOIN users u ON u.id=b.booster_id WHERE b.message_id IN (${placeholders}) ORDER BY b.created_at, b.id`,
     ...ids,
   );
   return messages.map((m) => {
@@ -197,7 +212,33 @@ export function messageData(messages) {
 }
 export const messageFragments = new FragmentCache(
   Number(process.env.CAMPFIRE_FRAGMENT_CACHE_MB || 32) * 1024 * 1024,
+  (entry) => entry.text.length * 2 + entry.bytes.length,
 );
+const fragmentEntry = (text) => ({ text, bytes: Buffer.from(text, "utf8") });
+
+// Runs produce() and returns the page it renders as UTF-8 chunks: template text, and the stored
+// bytes of each message fragment printed. Other results of produce() are returned as they are.
+export function renderChunks(produce) {
+  const outer = spliced;
+  const own = (spliced = []);
+  let html;
+  try {
+    html = produce();
+  } finally {
+    spliced = outer;
+  }
+  if (typeof html !== "string") return html;
+  const chunks = [];
+  let pos = 0;
+  for (let at; (at = html.indexOf(MARK, pos)) >= 0;) {
+    const end = html.indexOf("\u0000", at + MARK.length);
+    if (at > pos) chunks.push(Buffer.from(html.slice(pos, at), "utf8"));
+    chunks.push(own[Number(html.slice(at + MARK.length, end))]);
+    pos = end + 1;
+  }
+  if (pos < html.length) chunks.push(Buffer.from(html.slice(pos), "utf8"));
+  return chunks;
+}
 // Changing any template must not serve HTML rendered by the previous templates.
 const templateDigest = templateSources
   .reduce(
@@ -207,33 +248,60 @@ const templateDigest = templateSources
   .digest("hex")
   .slice(0, 12);
 
-// Like Rails' `cache message` (the Rust port's `presentation-v3` key): the message's id and
-// updated_at, which every write that changes its HTML touches. Copy links resolve paths in
-// the browser. The observed DB generation also namespaces fragments, so external writes
-// without timestamp changes and related-user renames cannot retain stale HTML.
-export function messageCacheKeys(rows) {
+const placeholders = (n) => Array(n).fill("?").join(",");
+const sha1 = (value) => createHash("sha1").update(value).digest("base64");
+
+// Rails keys on the message's updated_at alone. Writers that keep timestamps (replaceAttachment,
+// other processes, the sqlite3 CLI) exist, so the key is a digest of every row value messageData()
+// prints: the message and its creator and room columns, the whole body, the attachment blob, the
+// blobs the body embeds, the boosts in display order, and origin because Permalink embeds the
+// request host. Names of @mentioned users are not keyed, matching Rails, whose cached fragment
+// also keeps the old mention text until the message changes.
+export function messageCacheKeys(rows, origin = "") {
+  if (!rows.length) return [];
+  const ids = rows.map((m) => m.id);
+  const content = all(
+    `SELECT m.id,r.body,b.id AS blob_id,b.filename,b.content_type,(SELECT json_group_array(json_array(o.id,o.booster_id,o.updated_at,o.content,u.name,u.updated_at) ORDER BY o.created_at,o.id) FROM boosts o JOIN users u ON u.id=o.booster_id WHERE o.message_id=m.id) AS boosts FROM messages m LEFT JOIN action_text_rich_texts r ON r.record_type='Message' AND r.name='body' AND r.record_id=m.id LEFT JOIN active_storage_attachments a ON a.record_type='Message' AND a.name='attachment' AND a.record_id=m.id LEFT JOIN active_storage_blobs b ON b.id=a.blob_id WHERE m.id IN (${placeholders(ids.length)})`,
+    ...ids,
+  ).map((r) => ({ ...r, embeds: embeddedBlobIds(r.body || "") }));
+  const embedIds = [...new Set(content.flatMap((r) => r.embeds))];
+  const embeds = new Map(
+    embedIds.length
+      ? all(
+          `SELECT id,filename,content_type FROM active_storage_blobs WHERE id IN (${placeholders(embedIds.length)})`,
+          ...embedIds,
+        ).map((b) => [b.id, [b.filename, b.content_type]])
+      : [],
+  );
+  const versions = new Map(
+    content.map((r) => [
+      r.id,
+      [
+        r.body,
+        r.blob_id,
+        r.filename,
+        r.content_type,
+        r.embeds.map((id) => [id, embeds.get(id) ?? null]),
+        r.boosts,
+      ],
+    ]),
+  );
   return rows.map(
     (m) =>
-      `epoch:${renderEpoch()}/views/messages/_message:${templateDigest}/messages/${m.id}-${m.updated_at}/presentation-v3`,
-  );
-}
-
-// Like Rails' `cache membership` in users/sidebars/rooms/_direct. The row here also prints the
-// room's updated_at and the unread flag, so both are keyed; member names and avatars are not.
-export function cachedSidebarDirects(rooms, user, membersFor) {
-  const keys = rooms.map(
-    (r) =>
-      `epoch:${renderEpoch()}/views/sidebar_direct:${templateDigest}/memberships/${r.membership_id}-${r.membership_updated_at}/${r.updated_at}/${r.unread_at ? 1 : 0}`,
-  );
-  const missing = rooms.filter((_, i) => !messageFragments.has(keys[i]));
-  const members = missing.length ? membersFor(missing.map((r) => r.id)) : null;
-  return rooms.map((r, i) =>
-    messageFragments.fetch(keys[i], () =>
-      fragment("sidebar-direct", {
-        ...roomData(r, user, members?.get(r.id)),
-        Unread: !!r.unread_at,
-      }),
-    ),
+      `message/${templateDigest}/${m.id}/${sha1(
+        JSON.stringify([
+          m.updated_at,
+          m.created_at,
+          m.client_message_id,
+          m.creator_id,
+          m.creator_name,
+          m.creator_updated_at,
+          m.room_id,
+          m.room_name,
+          versions.get(m.id) ?? null,
+          origin,
+        ]),
+      )}`,
   );
 }
 
@@ -244,10 +312,11 @@ export function cachedMessages(rows, keys = messageCacheKeys(rows)) {
     messageData(missing).map((data) => [data.ID, fragment("message", data)]),
   );
   return rows.map((m, i) => ({
-    Fragment: safe(
-      messageFragments.fetch(
-        keys[i],
-        () => built.get(m.id) ?? fragment("message", messageData([m])[0]),
+    Fragment: new FragmentHtml(
+      messageFragments.fetch(keys[i], () =>
+        fragmentEntry(
+          built.get(m.id) ?? fragment("message", messageData([m])[0]),
+        ),
       ),
     ),
   }));

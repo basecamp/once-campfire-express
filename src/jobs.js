@@ -165,27 +165,32 @@ export async function settleJobHandoffs() {
   while (handoffs.size) await Promise.all([...handoffs]);
 }
 export function claim(at = Date.now() / 1000) {
+  return claimMany(1, at)[0] || null;
+}
+// One jobs-DB commit leases a whole batch instead of one commit per job.
+export function claimMany(limit, at = Date.now() / 1000) {
   const db = jobsDb();
   db.exec("BEGIN IMMEDIATE");
   try {
-    const row = statement(
-      "SELECT * FROM jobs WHERE status='ready' AND available_at<=? AND (lease_until IS NULL OR lease_until<=?) ORDER BY id LIMIT 1",
-    ).get(at, at);
-    if (!row) {
-      db.exec("COMMIT");
-      return null;
-    }
-    const token = crypto.randomBytes(16).toString("hex");
-    statement(
+    const rows = statement(
+      "SELECT * FROM jobs WHERE status='ready' AND available_at<=? AND (lease_until IS NULL OR lease_until<=?) ORDER BY id LIMIT ?",
+    ).all(at, at, limit);
+    const tokens = crypto.randomBytes(16 * rows.length).toString("hex");
+    const lease = statement(
       "UPDATE jobs SET attempts=attempts+1,lease_until=?,lease_token=? WHERE id=?",
-    ).run(at + 120, token, row.id);
+    );
+    const claimed = rows.map((row, i) => {
+      const token = tokens.slice(i * 32, i * 32 + 32);
+      lease.run(at + 120, token, row.id);
+      return {
+        ...row,
+        attempts: row.attempts + 1,
+        lease_token: token,
+        lease_until: at + 120,
+      };
+    });
     db.exec("COMMIT");
-    return {
-      ...row,
-      attempts: row.attempts + 1,
-      lease_token: token,
-      lease_until: at + 120,
-    };
+    return claimed;
   } catch (error) {
     db.exec("ROLLBACK");
     throw error;
@@ -207,6 +212,10 @@ export function finish(job, error = null, at = Date.now() / 1000) {
     job.lease_token,
   ).changes;
 }
+// Imported lazily because domain.js imports this module; the promise is reused per job.
+let domainImport, richtextImport;
+const domainModule = () => (domainImport ||= import("./domain.js"));
+const richtextModule = () => (richtextImport ||= import("./richtext.js"));
 export async function perform(kind, data) {
   if (kind === "purge") {
     purgeBlob(data.blob_id);
@@ -220,7 +229,7 @@ export async function perform(kind, data) {
     if (blob) await processAttachment(blob);
     return;
   }
-  const domain = await import("./domain.js");
+  const domain = await domainModule();
   if (kind === "ban-content") {
     for (const message of all(
       "SELECT * FROM messages WHERE creator_id=?",
@@ -239,7 +248,7 @@ export async function perform(kind, data) {
       "SELECT body FROM action_text_rich_texts WHERE record_type='Message' AND record_id=?",
       message.id,
     )?.body || "";
-  const { messagePlainText } = await import("./richtext.js");
+  const { messagePlainText } = await richtextModule();
   async function reply(text, attachment = null) {
     let result;
     try {
@@ -448,20 +457,32 @@ export function jobConcurrency() {
   return Number.isInteger(value) && value > 0 ? value : 3;
 }
 export const activeJobs = () => active;
+let refillScheduled = false;
+function scheduleFill() {
+  if (refillScheduled) return;
+  refillScheduled = true;
+  setImmediate(() => {
+    refillScheduled = false;
+    fill();
+  });
+}
 function fill() {
-  const limit = jobConcurrency();
-  while (!stopping && active < limit) {
-    let job;
-    try {
-      job = claim();
-    } catch (error) {
-      console.error("Campfire queue failed:", error.message);
-      break;
-    }
-    if (!job) break;
+  const free = jobConcurrency() - active;
+  if (stopping || free <= 0) return;
+  let claimed;
+  try {
+    claimed = claimMany(free);
+  } catch (error) {
+    console.error("Campfire queue failed:", error.message);
+    return;
+  }
+  for (const job of claimed) {
     active++;
     execute(job).finally(() => {
       active--;
+      // Jobs finishing in the same turn share one refill claim; the last one refills at once so
+      // drainQueue only resolves when a claim found nothing left.
+      if (active) return scheduleFill();
       fill();
       if (!active) for (const resolve of idle.splice(0)) resolve();
     });

@@ -806,8 +806,8 @@ async function httpSession(user, token) {
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }
-test("room HTML reflects edits, boosts and attachments within one frozen millisecond, reflects related renames, and never leaks hosts", async () => {
-  // Frozen time puts every write in one millisecond; touches must still move updated_at.
+test("room HTML reflects edits, boosts, renames and attachments even when timestamps do not move, and never leaks hosts", async () => {
+  // Frozen time makes every write reuse one updated_at, so freshness cannot rely on timestamps alone.
   const frozen = process.env.CAMPFIRE_FROZEN_TIME;
   process.env.CAMPFIRE_FROZEN_TIME = "2026-01-02T03:04:05.678Z";
   const http = await httpSession(admin, "fragment-cache-session");
@@ -857,40 +857,33 @@ test("room HTML reflects edits, boosts and attachments within one frozen millise
     });
     assert.ok((await room()).includes("Admin boosted Fragboost again"));
     run("UPDATE users SET name='Booster Renamed' WHERE id=?", admin.id);
+    try {
+      assert.ok(
+        (await room()).includes("Booster Renamed boosted Fragboost again"),
+        "b: booster rename shows",
+      );
+    } finally {
+      run("UPDATE users SET name='Admin' WHERE id=?", admin.id);
+    }
+
     run(
       "UPDATE users SET name='Renamed',updated_at=? WHERE id=?",
       now(),
       creator.id,
     );
+    html = await room();
+    assert.ok(
+      html.includes('<strong data-reply-target="author">Renamed</strong>'),
+      "c: rename shows",
+    );
+    assert.ok(!html.includes("Fragment Author"));
+
     run("UPDATE rooms SET name='Open Renamed' WHERE id=?", open.id);
-    try {
-      html = await room();
-      assert.ok(
-        html.includes("Booster Renamed boosted Fragboost again"),
-        "c: related renames invalidate cached fragments",
-      );
-      assert.ok(
-        html.includes('<strong data-reply-target="author">Renamed</strong>'),
-      );
-      domain.updateMessage(
-        domain.messageById(message.id),
-        "<p>Edited fragment body</p>",
-      );
-      html = await room();
-      assert.ok(
-        html.includes("Booster Renamed boosted Fragboost again"),
-        "c: booster rename shows once the message changes",
-      );
-      assert.ok(
-        html.includes('<strong data-reply-target="author">Renamed</strong>'),
-        "c: creator rename shows once the message changes",
-      );
-      assert.ok(!html.includes("Fragment Author"));
-      assert.ok(html.includes(">Open Renamed</a>"), "c: room rename shows");
-    } finally {
-      run("UPDATE users SET name='Admin' WHERE id=?", admin.id);
-      run("UPDATE rooms SET name='Open' WHERE id=?", open.id);
-    }
+    assert.ok(
+      (await room()).includes(">Open Renamed</a>"),
+      "room rename shows",
+    );
+    run("UPDATE rooms SET name='Open' WHERE id=?", open.id);
 
     replaceAttachment(
       {
@@ -1065,6 +1058,68 @@ test("sidebar direct rows also invalidate on related-user writes", async () => {
       html.includes(
         `class="direct unread" id="list_rooms_direct_${direct.id}"`,
       ),
+    );
+  } finally {
+    await http.close();
+  }
+});
+
+test("search pages list backdated matches in insertion order", async () => {
+  const http = await httpSession(admin, "search-order-session");
+  try {
+    const older = domain.createMessage(
+      open.id,
+      admin.id,
+      "<p>ordermarker first</p>",
+    );
+    const newer = domain.createMessage(
+      open.id,
+      admin.id,
+      "<p>ordermarker second</p>",
+    );
+    run(
+      "UPDATE messages SET created_at='2001-01-01 00:00:00.000000' WHERE id=?",
+      newer.id,
+    );
+    const html = await http.page("/searches?q=ordermarker");
+    const ids = [...html.matchAll(/data-message-id="(\d+)"/g)].map(
+      (m) => +m[1],
+    );
+    assert.deepEqual(ids, [older.id, newer.id]);
+  } finally {
+    await http.close();
+  }
+});
+
+test("a posted message answers with the same fragment it broadcasts and indexes it once", async () => {
+  const { cachedMessages } = await import("../src/rendering.js");
+  const http = await httpSession(admin, "turbo-post-session");
+  try {
+    const response = await http.post(`/rooms/${open.id}/messages`, {
+      "message[body]": "<p>Turbo <b>echo</b> marker</p>",
+      "message[client_message_id]": "turbo-echo-1",
+    });
+    assert.equal(response.status, 200);
+    const message = get(
+      "SELECT id FROM messages WHERE client_message_id='turbo-echo-1'",
+    );
+    assert.equal(
+      await response.text(),
+      `<turbo-stream action="append" target="messages_rooms_open_${open.id}"><template>${String(cachedMessages([domain.messageById(message.id)])[0].Fragment)}</template></turbo-stream>`,
+    );
+    assert.deepEqual(
+      all(
+        "SELECT rowid,body FROM message_search_index WHERE rowid=?",
+        message.id,
+      ).map((r) => ({ ...r })),
+      [{ rowid: message.id, body: "Turbo echo marker" }],
+    );
+    assert.equal(
+      get(
+        "SELECT count(*) AS n FROM action_text_rich_texts WHERE record_type='Message' AND record_id=?",
+        message.id,
+      ).n,
+      1,
     );
   } finally {
     await http.close();

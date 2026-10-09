@@ -1,14 +1,14 @@
 import { createHash, randomBytes } from "node:crypto";
 import bcrypt from "bcryptjs";
-import { all, get, run, transaction, now, touch } from "./db.js";
+import { all, get, run, transaction, now } from "./db.js";
 import {
   roomForUser,
   roomsForUser,
   userById,
   messageById,
-  searchMessages,
   directMembers,
   messagesForRoom,
+  searchMessageIds,
   messagesByIds,
   refreshMessages,
   grantMemberships,
@@ -26,7 +26,6 @@ import {
   fragment,
   messageData,
   cachedMessages,
-  cachedSidebarDirects,
   messageCacheKeys,
   roomData,
   userData,
@@ -36,7 +35,7 @@ import {
   safe,
 } from "./rendering.js";
 import { escape, plainText, messagePlainText } from "./richtext.js";
-import { beginPage, sendCachedPage } from "./response_cache.js";
+import { beginPage, dependOn, sendCachedPage } from "./response_cache.js";
 import * as rails from "./rails.js";
 import { publish, forgetUser } from "./cable.js";
 import {
@@ -354,12 +353,17 @@ export function registerRoutes(app) {
       // Cookies come from these session values on every request, cache hit or not.
       req.lastRoom = room.id;
       req.session.last_room_id = room.id;
-      sendCachedPage(req, res, "room", () =>
-        render(req, "room", {
+      sendCachedPage(req, res, "room", () => {
+        const shown = { around: req.params.messageId };
+        const rows = messagesForRoom(room.id, shown);
+        dependOn(req, {
+          room: room.id,
+          messages: rows.map((m) => m.id),
+          window: { room: room.id, ...shown },
+        });
+        return render(req, "room", {
           Room: roomData(room, req.user),
-          Messages: cachedMessages(
-            messagesForRoom(room.id, { around: req.params.messageId }),
-          ),
+          Messages: cachedMessages(rows),
           LoadedAt: epoch(room.updated_at),
           Stream: rails.signStream(rails.stream(room)),
           Involvement: get(
@@ -368,8 +372,8 @@ export function registerRoutes(app) {
             req.user.id,
           ).involvement,
           Invitation: false,
-        }),
-      );
+        });
+      });
     },
   );
   app.delete("/rooms/:roomId", login, (req, res) => {
@@ -382,6 +386,7 @@ export function registerRoutes(app) {
     sendCachedPage(req, res, "sidebar", () => sidebar(req)),
   );
   function sidebar(req) {
+    dependOn(req, { sidebar: true });
     const rooms = roomsForUser(req.user.id).filter(
       (r) => r.involvement !== "invisible",
     );
@@ -394,19 +399,14 @@ export function registerRoutes(app) {
             ? 1
             : (a.name || "").localeCompare(b.name || ""),
     );
-    const directs = rooms.filter((r) => r.type === "Rooms::Direct");
-    const directRows = new Map(
-      cachedSidebarDirects(directs, req.user, directMembers).map((html, i) => [
-        directs[i].id,
-        html,
-      ]),
+    const members = directMembers(
+      rooms.filter((r) => r.type === "Rooms::Direct").map((r) => r.id),
     );
     return render(req, "sidebar", {
-      SidebarRooms: rooms.map((r) =>
-        r.type === "Rooms::Direct"
-          ? { Type: r.type, Fragment: directRows.get(r.id) }
-          : { ...roomData(r, req.user), Unread: !!r.unread_at },
-      ),
+      SidebarRooms: rooms.map((r) => ({
+        ...roomData(r, req.user, members.get(r.id)),
+        Unread: !!r.unread_at,
+      })),
       Placeholders: [],
     });
   }
@@ -452,14 +452,28 @@ export function registerRoutes(app) {
         }
         if (!json)
           return message
-            ? sendCachedPage(req, res, "show-message", () =>
-                render(req, "show-message", {
+            ? sendCachedPage(req, res, "show-message", () => {
+                dependOn(req, { messages: [message.id] });
+                return render(req, "show-message", {
                   Messages: cachedMessages([message]),
-                }),
-              )
+                });
+              })
             : sendCachedPage(req, res, "messages", () => {
-                const rows = messagesForRoom(room.id, req.query);
+                const { before, after, around } = req.query;
+                const rows = messagesForRoom(room.id, {
+                  before,
+                  after,
+                  around,
+                });
                 if (!rows.length) return void res.sendStatus(204);
+                dependOn(req, {
+                  // Paging anchors are not shown but must still exist.
+                  messages: [
+                    ...rows.map((m) => m.id),
+                    ...[before, after].filter(Boolean).map(Number),
+                  ],
+                  window: { room: room.id, before, after, around },
+                });
                 const keys = messageCacheKeys(rows);
                 res.set("ETag", messagesEtag(keys));
                 if (req.fresh) return void res.status(304).end();
@@ -825,7 +839,7 @@ function registerBoosts(app) {
             time,
           ),
           id = Number(result.lastInsertRowid);
-        touch("messages", message.id);
+        run("UPDATE messages SET updated_at=? WHERE id=?", time, message.id);
         const dto = messageData([message])[0],
           boost = dto.Boosts.find((b) => b.ID === id);
         publish(
@@ -860,7 +874,7 @@ function registerBoosts(app) {
           ),
         );
         run("DELETE FROM boosts WHERE id=?", Number(req.params.id));
-        touch("messages", message.id);
+        run("UPDATE messages SET updated_at=? WHERE id=?", now(), message.id);
         publish(
           rails.stream(room),
           `<turbo-stream action="remove" target="boost_${req.params.id}"></turbo-stream>`,
@@ -1285,7 +1299,12 @@ function registerSearch(app) {
     sendCachedPage(req, res, "search", () => search(req, query));
   });
   function search(req, query) {
-    const rows = searchMessages(req.user, query);
+    const found = searchMessageIds(req.user.id, query);
+    const rows = messagesByIds(found).sort((a, b) => a.id - b.id);
+    dependOn(req, {
+      search: { query, found },
+      messages: rows.map((m) => m.id),
+    });
     return render(req, "search", {
       Messages: cachedMessages(rows),
       Query: query,

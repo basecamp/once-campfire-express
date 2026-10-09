@@ -3,7 +3,7 @@ import http from "node:http";
 import { initialize, deferCheckpoints, databaseFile, db } from "./db.js";
 import { parseWebWorkers } from "./workers.js";
 import { createApp } from "./app.js";
-import { attachCable } from "./cable.js";
+import { attachCable, relayCable } from "./cable.js";
 import {
   startWorker,
   stopWorker,
@@ -26,10 +26,12 @@ if (cluster.isPrimary) {
   if (file && file !== ":memory:") checkpointer = startCheckpointer(file);
   startWorker();
   if (workers > 1) {
+    // Advanced (structured clone) IPC copies broadcast HTML as raw bytes; JSON escaped every quote.
+    cluster.setupPrimary({ serialization: "advanced" });
     for (let i = 0; i < workers; i++) cluster.fork();
     cluster.on("message", (worker, event) => {
       if (event?.type === "cable" || event?.type === "cable-batch")
-        for (const w of Object.values(cluster.workers)) w.send(event);
+        relayCable(event);
       else acceptJobsMessage(event);
     });
     cluster.on("exit", (worker, code, signal) => {

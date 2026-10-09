@@ -9,13 +9,12 @@ With this repository's `reference` submodule checked out:
 
 ```sh
 npm run bench:image       # rebuild the Node production image after changes
-npm run bench:image:bun   # rebuild the Bun production image
 npm run bench            # HTTP reads, then HTTP writes
 ```
 
-The default apps are `express,express-bun,rust`; build the Rust production image separately
+The default apps are `express,rust`; build the Rust production image separately
 or pass `--apps` to select a subset. `--help` lists all options. `VERIFICATION_ROOT`,
-`LOADGEN`, `BENCH_ENV_FILE`, `RUST_IMAGE`, `EXPRESS_IMAGE` and `EXPRESS_BUN_IMAGE`
+`LOADGEN`, `BENCH_ENV_FILE`, `RUST_IMAGE` and `EXPRESS_IMAGE`
 can override paths or image names. `<APP>_BENCH_ENV` adds JSON environment overrides.
 Each npm suite writes to ignored `tmp/bench/results/{reads,writes}/` here; the direct
 `ruby bench/compare.rb` command uses ignored `tmp/bench/` in the verification checkout.

@@ -4,7 +4,6 @@ import zlib from "node:zlib";
 import http from "node:http";
 process.env.DATABASE_PATH = ":memory:";
 process.env.SECRET_KEY_BASE = "spliced-gzip-tests-".repeat(8);
-process.env.CAMPFIRE_RESPONSE_CACHE_MB = "32";
 const { SplicedGzip, gzipSpliced, splicedGzipCache, fastEtag } =
   await import("../src/gzip.js");
 const { run, get, now, initialize } = await import("../src/db.js");
@@ -509,22 +508,46 @@ function fuzz(gzip, seed, iterations) {
   return fullyReused;
 }
 
-test("gzipWhole equals the one-piece spliced gzip without touching its cache", async () => {
-  const { gzipWhole } = await import("../src/gzip.js");
+test("gzipChunks round trips any chunking and reuses pieces of unchanged chunks", () => {
   const gzip = new SplicedGzip(32 << 20);
-  for (const body of [page("whole", 5), page("whole", 120), "ż".repeat(5000)]) {
-    const bytes = Buffer.from(body, "utf8");
-    const before = splicedGzipCache.stats();
-    const whole = gzipWhole(bytes);
-    assert.deepEqual(splicedGzipCache.stats(), before);
-    assert.ok(whole.equals(gzip.gzip(bytes)));
-    assertSingleMemberGzip(whole, body);
+  const pieces = (from, to, n = to - from) =>
+    Array.from({ length: n }, (_, i) =>
+      Buffer.from(
+        `<div id="m${from + i}">Zażółć 🔥 ${"lorem ipsum ".repeat(((from + i) % 9) * 150 + 400)}</div>\n`,
+        "utf8",
+      ),
+    );
+  const head = Buffer.from("<!DOCTYPE html><html><body>");
+  const tail = Buffer.from("</body></html>");
+  const chunked = (list) => [head, ...list, tail];
+  for (const chunks of [
+    [],
+    [Buffer.from("ż".repeat(5000))],
+    chunked(pieces(0, 40)),
+  ]) {
+    const body = Buffer.concat(chunks).toString("utf8");
+    assertSingleMemberGzip(gzip.gzipChunks(chunks), body);
   }
+  const fresh = new SplicedGzip(32 << 20);
+  fresh.gzipChunks(chunked(pieces(0, 40)));
+  const all = fresh.stats().misses;
+  gzip.gzipChunks(chunked(pieces(0, 40)));
+  const misses = gzip.stats().misses;
+  const scrolled = chunked(pieces(1, 41));
+  assertSingleMemberGzip(
+    gzip.gzipChunks(scrolled),
+    Buffer.concat(scrolled).toString("utf8"),
+  );
+  assert.ok(
+    gzip.stats().misses - misses < all / 2,
+    "pieces more than a window after the dropped message are reused",
+  );
 });
 
 test("sendPage answers like res.send(string) through the middleware", async () => {
   const express = (await import("express")).default;
-  const { splicedGzip, sendPage, gzipWhole } = await import("../src/gzip.js");
+  const { splicedGzip, sendPage } = await import("../src/gzip.js");
+  const gzip = new SplicedGzip(32 << 20);
   const app = express();
   app.use(splicedGzip());
   const body = page("fixed-token", 20);
@@ -534,7 +557,7 @@ test("sendPage answers like res.send(string) through the middleware", async () =
     return {
       bytes,
       etag: fastEtag(bytes),
-      gzip: () => gzipWhole(bytes),
+      gzip: () => gzip.gzipChunks([bytes]),
     };
   };
   app.get("/string", (req, res) => res.type("html").send(body));

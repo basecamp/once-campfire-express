@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
 let connection,
   depth = 0;
+export const BUSY_TIMEOUT_MS = 10000;
 const callbacks = [];
 export function onCommit(fn) {
   if (depth) callbacks.at(-1).push(fn);
@@ -24,7 +25,9 @@ export function initialize(
   if (path !== ":memory:")
     mkdirSync(dirname(resolve(path)), { recursive: true });
   connection = openDatabase(path);
-  connection.exec("PRAGMA busy_timeout=10000; PRAGMA foreign_keys=ON;");
+  connection.exec(
+    `PRAGMA busy_timeout=${BUSY_TIMEOUT_MS}; PRAGMA foreign_keys=ON;`,
+  );
   if (
     !connection
       .prepare("SELECT name FROM sqlite_master WHERE name='users'")
@@ -36,7 +39,7 @@ export function initialize(
   }
   validateSchema(connection);
   connection.exec(
-    "CREATE INDEX IF NOT EXISTS index_messages_on_room_id_and_updated_at ON messages(room_id,updated_at)",
+    "CREATE INDEX IF NOT EXISTS index_messages_on_room_id_and_updated_at ON messages(room_id,updated_at); CREATE INDEX IF NOT EXISTS index_messages_on_room_id_and_created_at ON messages(room_id,created_at)",
   );
   applyDurabilityPragmas(connection);
   return connection;
@@ -55,9 +58,7 @@ export function deferCheckpoints(
 ) {
   target.exec(`PRAGMA wal_autocheckpoint=${pages}`);
 }
-// bun:sqlite exposes .filename, node:sqlite a location() method.
-export const databaseFile = () =>
-  connection && (connection.filename ?? connection.location());
+export const databaseFile = () => connection && connection.location();
 export function db() {
   return connection || initialize();
 }
@@ -82,10 +83,9 @@ export const all = (sql, ...params) => {
   executed++;
   return statement(sql).all(...params);
 };
-// bun:sqlite returns null for no row; callers test for undefined.
 export const get = (sql, ...params) => {
   executed++;
-  return statement(sql).get(...params) ?? undefined;
+  return statement(sql).get(...params);
 };
 // Counts this connection's own writes: PRAGMA data_version only moves for other connections' commits.
 let writes = 0;
@@ -94,19 +94,17 @@ export function run(sql, ...params) {
   executed++;
   writes++;
   clearQueryCache();
-  return statement(sql).run(...params);
+  const prepared = statement(sql);
+  if (depth) return prepared.run(...params);
+  // An autocommit statement that fails with SQLITE_BUSY changed nothing, so it is safe to retry.
+  return pollWriteLock(db(), BUSY_TIMEOUT_MS, () => prepared.run(...params));
 }
 
 const queryCache = new Map();
 let hits = 0,
   misses = 0,
   seenDataVersion;
-let renderGeneration = 0;
-export const renderEpoch = () => renderGeneration;
-export const clearQueryCache = () => {
-  queryCache.clear();
-  renderGeneration++;
-};
+export const clearQueryCache = () => queryCache.clear();
 export const queryCacheStats = () => ({
   size: queryCache.size,
   hits,
@@ -116,7 +114,7 @@ export const queryCacheStats = () => ({
 function validateQueryCache() {
   const { data_version } = statement("PRAGMA data_version").get();
   if (data_version !== seenDataVersion) {
-    clearQueryCache();
+    queryCache.clear();
     seenDataVersion = data_version;
   }
 }
@@ -163,51 +161,36 @@ export function now() {
     .replace("Z", "")
     .replace(/(\.\d{3})$/, "$1000");
 }
-function microseconds(value) {
-  const match = /^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(?:\.(\d{1,6}))?/.exec(
-    value || "",
-  );
-  if (!match) return 0;
-  return (
-    Date.parse(match[1].replace(" ", "T") + "Z") * 1000 +
-    Number((match[2] || "").padEnd(6, "0"))
-  );
+const isBusy = (error) => (error?.errcode & 0xff) === 5;
+const pause = new Int32Array(new SharedArrayBuffer(4));
+// SQLite's busy handler sleeps 1, 2, 5, 10... ms between lock attempts while a post holds the
+// write lock for ~0.2 ms, so cluster workers mostly slept on a free lock. Retrying every
+// 0.025-1.5 ms (jittered Atomics.wait sleeps, no spinning) keeps the same overall deadline.
+// Every main-DB writer polls, so autocommit writes are not starved by polling transactions.
+function pollWriteLock(target, timeout, attempt) {
+  target.exec("PRAGMA busy_timeout=0");
+  try {
+    const deadline = Date.now() + timeout;
+    for (let wait = 0.05; ; wait = Math.min(wait * 1.5, 1)) {
+      try {
+        return attempt();
+      } catch (error) {
+        if (!isBusy(error) || Date.now() >= deadline) throw error;
+      }
+      Atomics.wait(pause, 0, 0, wait * (0.5 + Math.random()));
+    }
+  } finally {
+    target.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS}`);
+  }
 }
-function formatMicroseconds(us) {
-  return (
-    new Date(Math.floor(us / 1000))
-      .toISOString()
-      .slice(0, 19)
-      .replace("T", " ") +
-    "." +
-    String(us % 1_000_000).padStart(6, "0")
-  );
-}
-let lastTouch = 0;
-// Fragment keys carry updated_at, so a touch must move it even within one millisecond, under
-// CAMPFIRE_FROZEN_TIME, or when another worker wrote a later value: one microsecond past both
-// this process's last touch and the row's current value.
-export function touchTime(previous) {
-  const base = process.env.CAMPFIRE_FROZEN_TIME
-    ? new Date(process.env.CAMPFIRE_FROZEN_TIME).getTime()
-    : Date.now();
-  lastTouch = Math.max(base * 1000, lastTouch + 1, microseconds(previous) + 1);
-  return formatMicroseconds(lastTouch);
-}
-const touchable = new Set(["messages"]);
-export function touch(table, id) {
-  if (!touchable.has(table)) throw new Error(`Cannot touch ${table}`);
-  const time = touchTime(
-    get(`SELECT updated_at FROM ${table} WHERE id=?`, Number(id))?.updated_at,
-  );
-  run(`UPDATE ${table} SET updated_at=? WHERE id=?`, time, Number(id));
-  return time;
-}
+export const beginImmediate = (target = db(), timeout = BUSY_TIMEOUT_MS) =>
+  pollWriteLock(target, timeout, () => target.exec("BEGIN IMMEDIATE"));
 export function transaction(fn) {
   const name = `nested_${depth}`,
     nested = depth > 0;
   clearQueryCache();
-  db().exec(nested ? `SAVEPOINT ${name}` : "BEGIN IMMEDIATE");
+  if (nested) db().exec(`SAVEPOINT ${name}`);
+  else beginImmediate();
   depth++;
   callbacks.push([]);
   let result, hooks;

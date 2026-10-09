@@ -38,17 +38,13 @@ test("Nested post-commit work runs only after durable outer commit and disappear
   });
   assert.deepEqual(observed, ["Committed"]);
 });
-test("Integers read back as numbers; values beyond 2^53 throw on Node and round on Bun", () => {
+test("Integers read back as numbers; values beyond 2^53 throw", () => {
   run("CREATE TABLE IF NOT EXISTS big(v INTEGER)");
   run("INSERT INTO big VALUES(?)", 2 ** 53 - 1);
   assert.equal(get("SELECT v FROM big").v, 2 ** 53 - 1);
   run("DELETE FROM big");
   run("INSERT INTO big VALUES(?)", 9007199254740993n);
-  if (globalThis.Bun)
-    // safeIntegers:false trades exactness above 2^53 for the native number fast path.
-    assert.equal(get("SELECT v FROM big").v, 9007199254740992);
-  else
-    assert.throws(() => get("SELECT v FROM big"), { code: "ERR_OUT_OF_RANGE" });
+  assert.throws(() => get("SELECT v FROM big"), { code: "ERR_OUT_OF_RANGE" });
   run("DROP TABLE big");
 });
 test("SQLite adapter opens read-only databases and writes consistent backups", () => {

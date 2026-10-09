@@ -14,6 +14,7 @@ import {
   authChecks,
   forgetUser,
   indexedSubscriptions,
+  relayCable,
 } from "../src/cable.js";
 import { createMessage, publishMessage } from "../src/domain.js";
 import { signCookie, signStream, stream } from "../src/rails.js";
@@ -233,10 +234,11 @@ test("publishMessage delivers the room event then one unread event per member", 
   await wait(
     () => frames.filter((f) => f.type === "confirm_subscription").length === 2,
   );
-  publishMessage(createMessage(1, 1, "batched hello"));
+  const html = publishMessage(createMessage(1, 1, "batched hello"));
   await wait(() => frames.some((f) => f.message?.roomId === 1));
   const delivered = frames.filter((f) => f.message);
-  assert.match(delivered[0].message, /batched hello/);
+  assert.match(html, /batched hello/);
+  assert.ok(delivered[0].message.includes(`<template>${html}</template>`));
   // Appends use the messages controller's own scrolling; nesting maintain-scroll prevents insertion.
   assert.doesNotMatch(delivered[0].message, /maintain_scroll/);
   assert.deepEqual(delivered[1].message, { roomId: 1 });
@@ -352,8 +354,6 @@ test("A client that fails alive() is checked once per batch, not per event", asy
 });
 test("Unauthenticated sockets are denied before upgrade", async () => {
   const ws = new WebSocket(base, ["actioncable-v1-json"]);
-  // Not events.once: Bun's ws shim forwards one failure once per on("error")
-  // registration and once() registers via both once() and on(), so a copy goes unhandled.
   await new Promise((resolve) => ws.on("error", resolve));
   assert.equal(ws.readyState, WebSocket.CLOSED);
 });
@@ -440,6 +440,24 @@ test("Fan-out across 50 sockets and 2 streams delivers exact counts", async () =
   );
   await closeAll(sockets);
   await wait(() => indexedSubscriptions() === 0);
+});
+test("the primary relays a worker's broadcast to every other worker", () => {
+  const sent = [];
+  const workers = Object.fromEntries(
+    [1, 2, 3].map((id) => [id, { id, send: (e) => sent.push([id, e]) }]),
+  );
+  const event = { type: "cable-batch", events: [], origin: 2 };
+  relayCable(event, workers);
+  assert.deepEqual(
+    sent.map(([id]) => id),
+    [1, 3],
+  );
+  sent.length = 0;
+  relayCable({ type: "cable-batch", events: [] }, workers);
+  assert.deepEqual(
+    sent.map(([id]) => id),
+    [1, 2, 3],
+  );
 });
 
 test("external membership revocation is checked on the next broadcast", async () => {

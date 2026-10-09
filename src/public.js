@@ -4,10 +4,12 @@ import crypto from "node:crypto";
 import QRCode from "qrcode";
 import { get } from "./db.js";
 import * as rails from "./rails.js";
+import { publicResponses } from "./static_responses.js";
 import {
   variant,
   pathFor,
   serve,
+  serveBytes,
   removeAttachment,
   purgeBlob,
 } from "./storage.js";
@@ -67,16 +69,61 @@ function cache(req, res, etag) {
   }
   return false;
 }
+// Every field buildAvatar reads, so a foreign writer that leaves updated_at alone still changes the ETag.
+const avatarInputs = (user, blob) => [
+  user.id,
+  user.name,
+  user.role,
+  user.updated_at,
+  blob && [blob.id, blob.key, blob.checksum],
+];
+async function buildAvatar(user, blob) {
+  if (blob) {
+    const out = await variant(blob, [512, 512], "webp");
+    return {
+      body: await fs.promises.readFile(pathFor(out.key)),
+      filename: out.filename,
+    };
+  }
+  if (user.role === 2)
+    return {
+      svg: true,
+      body: fs.readFileSync(
+        "reference/app/assets/images/default-bot-avatar.svg",
+      ),
+    };
+  const initials = Array.from(user.name.matchAll(/(?:^|\s)(\S)/gu))
+    .map((m) => m[1])
+    .join("");
+  const svg = fs
+    .readFileSync("reference/app/views/users/avatars/show.svg.erb", "utf8")
+    .replace(
+      "<%= avatar_background_color(@user) %>",
+      colors[crc32(String(user.id)) % colors.length],
+    )
+    .replace("<%= @user.initials %>", escape(initials))
+    .replace(
+      /<%=raw .*? %>/g,
+      initials.length >= 3
+        ? 'textLength="85%" lengthAdjust="spacingAndGlyphs"'
+        : "",
+    );
+  // A string body keeps res.send's "; charset=utf-8"; the bot file is sent as a Buffer without it.
+  return { svg: true, body: svg };
+}
+function sendAvatar(req, res, avatar) {
+  if (avatar.svg) return res.type("image/svg+xml").send(avatar.body);
+  serveBytes(req, res, avatar.body, "image/webp", avatar.filename);
+}
+export const healthCheck = (req, res) =>
+  req.accepts(["html", "json"]) === "json"
+    ? res.json({ status: "ok" })
+    : res
+        .type("html")
+        .send(
+          '<!doctype html><html><body style="background-color: green"></body></html>',
+        );
 export function registerPublic(app) {
-  app.get("/up", (req, res) =>
-    req.accepts(["html", "json"]) === "json"
-      ? res.json({ status: "ok" })
-      : res
-          .type("html")
-          .send(
-            '<!doctype html><html><body style="background-color: green"></body></html>',
-          ),
-  );
   app.get("/users/:userId/avatar", async (req, res) => {
     try {
       const user = get(
@@ -87,41 +134,15 @@ export function registerPublic(app) {
       const blob = attachment("User", user.id, "avatar");
       const etag = `"${crypto
         .createHash("sha256")
-        .update(JSON.stringify([user.id, user.name, user.updated_at, blob?.id]))
+        .update(JSON.stringify(avatarInputs(user, blob)))
         .digest("hex")}"`;
       if (cache(req, res, etag)) return;
-      if (blob) {
-        const out = await variant(blob, [512, 512], "webp");
-        return serve(req, res, pathFor(out.key), "image/webp", out.filename);
-      }
-      if (user.role === 2)
-        return res
-          .type("image/svg+xml")
-          .send(
-            fs.readFileSync(
-              "reference/app/assets/images/default-bot-avatar.svg",
-            ),
-          );
-      const initials = Array.from(user.name.matchAll(/(?:^|\s)(\S)/gu))
-        .map((m) => m[1])
-        .join("");
-      let svg = fs.readFileSync(
-        "reference/app/views/users/avatars/show.svg.erb",
-        "utf8",
-      );
-      svg = svg
-        .replace(
-          "<%= avatar_background_color(@user) %>",
-          colors[crc32(String(user.id)) % colors.length],
-        )
-        .replace("<%= @user.initials %>", escape(initials))
-        .replace(
-          /<%=raw .*? %>/g,
-          initials.length >= 3
-            ? 'textLength="85%" lengthAdjust="spacingAndGlyphs"'
-            : "",
-        );
-      res.type("image/svg+xml").send(svg);
+      // The ETag covers every input of the body, so an entry under it never goes stale.
+      const cached = publicResponses.get("avatar:" + etag);
+      if (cached) return sendAvatar(req, res, cached);
+      const built = await buildAvatar(user, blob);
+      publicResponses.fetch("avatar:" + etag, () => built);
+      sendAvatar(req, res, built);
     } catch {
       res.sendStatus(404);
     }

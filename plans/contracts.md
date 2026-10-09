@@ -23,7 +23,7 @@ Malformed/legacy rich text outside the independent corpus can differ. Unsupporte
 older SQLite schemas require migration by the original application before upgrade.
 
 The figures below describe the earlier frozen runtime `124694f` (Node 24.21.0 / Express
-5.2.1); README.md lists a later matched run of the caching branch on Node and Bun. All 52
+5.2.1); README.md lists a later matched run of the caching branch. All 52
 native methods pass without seed skips. Independent checks passed 26 browser
 assertions without JavaScript errors, 18 HTTP/session checks, 11 request boundaries,
 6 crafted room-namespace checks, 4 real multi-tab presence checks and 3 socket
@@ -36,12 +36,11 @@ The unchanged common load generator and original seed hashes are recorded in ign
 scratch evidence. Benchmark orchestration is Ruby, and server processes share four
 hardware threads; Express uses three HTTP workers and its primary job/fanout process.
 
-## Runtimes, templates and caches: known differences
+## Runtime, templates and caches: known differences
 
-Node 24 is the default runtime (`.node-version`, `Dockerfile`); Bun 1.4.2 is optional
-(`.bun-version`, `Dockerfile.bun`). `src/sqlite.js` selects `node:sqlite` or `bun:sqlite`
-once at load; `src/gzip.js` hashes with `Bun.hash` on Bun and `zlib.crc32` on Node. Unit tests alone do not establish production parity; the
-branch needs fresh production Docker checks and re-measured benchmarks.
+Node 24 is the only runtime (`.node-version`, `Dockerfile`, `node:sqlite`). Unit tests alone do not establish production parity; the
+production image passed the shared route contracts and write audits in a local benchmark run on 2026-10-08
+(README Benchmarks). It has not yet run in shared verification or the shared browser flows.
 
 - Templates: Eta 4.6.0, one `templates/eta/*.eta` per former nunjucks macro, converted
   mechanically from `templates/pages.html` by `bin/nunjucks-to-eta.js`. Output is
@@ -54,30 +53,24 @@ branch needs fresh production Docker checks and re-measured benchmarks.
   session/user/account/ban reads. Invalidated on own writes and on `PRAGMA data_version`
   change (other workers, jobs). Contract: every main-DB write goes through db.js
   `run()`/`transaction()`.
-- Message fragment cache, per worker (`CAMPFIRE_FRAGMENT_CACHE_MB`,
-  default 32) keyed like Rails/Rust: template digest, id, `updated_at`, `presentation-v3`,
-  plus origin (permalinks embed the host). Body edits, attachment changes and boosts touch
-  `messages.updated_at` with strictly increasing microsecond values (also under
-  `CAMPFIRE_FROZEN_TIME`). An observed DB generation also namespaces fragments, so
-  related-user changes and external edits without timestamp updates refresh their HTML.
-- Sidebar direct-room rows share that cache, keyed by membership id/`updated_at` plus the
-  room's `updated_at`, unread flag and observed DB generation; member changes refresh
-  their HTML even without touching the membership.
-- Thruster-style in-memory cache (`CAMPFIRE_FRONT_CACHE_MB`, default 64, items ≤ 1 MB) for
-  GET/HEAD responses with `public` and a positive max-age (avatars, assets): keyed by
-  method, URL, host and `Vary` headers, Set-Cookie stripped, `X-Cache: hit|miss|bypass`,
-  304 from the stored ETag.
+- Message fragment cache (`CAMPFIRE_FRAGMENT_CACHE_MB`, default 32, per worker). Key:
+  template digest, origin and a digest of every value the fragment prints (message row,
+  whole body, attachment and embedded blob names and types, boosts in display order,
+  creator/booster/room names, avatar versions). Differs from Rails: writes that keep
+  timestamps and creator/booster renames show immediately (Rails' `cache [message, ...]`
+  keys on `updated_at`); @mention names stay stale until the message changes, as in Rails.
 - Messages page answers 304 via ETag from the fragment keys (Rails `fresh_when @messages`).
 - Action Cable authorization memo `CABLE_AUTH_TTL_MS` (default 1000): revocation is
   immediate in the worker that performs it (`forgetUser`), within the TTL elsewhere.
-- Integers above 2^53 read from SQLite throw on Node and are rounded by `bun:sqlite`
-  (safeIntegers off); Campfire's schema stores none.
+- Integers above 2^53 read from SQLite throw; Campfire's schema stores none.
+- Two indexes absent from the Rails schema are created at startup (`CREATE INDEX IF NOT
+  EXISTS`, tables unchanged): `messages(room_id, updated_at)` for room refresh and
+  `messages(room_id, created_at)`, which covers message paging and response-cache window
+  revalidation. The `around` halves break `created_at` ties by id like the other pages
+  (Rails leaves their order to SQLite).
 - `WEB_WORKERS` defaults to `auto` (`os.availableParallelism()`, respecting cpusets). Cluster
   workers listen with `reusePort` on Linux (`REUSE_PORT=0` disables).
-- HTML ETags are `W/"<length>-<fast hash>"`; values differ between runtimes. The message
-  body digest memo keys on `updated_at`, length and a head/tail sample, so a same-millisecond
-  edit with identical length, head and tail can serve stale cached HTML (Rails keys on
-  `updated_at` alone).
+- HTML ETags are `W/"<length>-<crc32>"`.
 - CSRF: `Sec-Fetch-Site` replaces tokens. Writes accept `same-origin` and `same-site`,
   reject `cross-site`, `none`, invalid values and missing headers over HTTPS with 422.
   A provided Origin must match the effective origin, including its port; null and empty
@@ -92,20 +85,63 @@ branch needs fresh production Docker checks and re-measured benchmarks.
   not configure TLS termination or redirects. The 189 Rails CSRF vectors still test `validCsrf`/`maskCsrf`, which
   requests no longer call.
 - Whole-page response cache per worker (`CAMPFIRE_RESPONSE_CACHE_MB`, default 64 MiB,
-  0 disables it) for room, permalink, messages, sidebar, search and show-message HTML.
-  Session and access checks run on every request; any main-DB commit, including one from
-  another process, invalidates entries. Request variants remain separate, and cookies
-  and security headers stay fresh. GET and HEAD share completed HTML/gzip bodies without
-  changing their content or validators. Flash-bearing responses bypass the cache.
+  capped at 1024; 0 or invalid disables) for GET/HEAD HTML: room, permalink, messages page, sidebar, search, show-message.
+  An entry is current for the DB epoch it was stored in. After any commit (any process) it is
+  revalidated, like Rails cache keys: a few indexed reads of exactly what the page prints
+  (viewer/account rows, logo, room row, involvement, direct members, sidebar rooms with
+  unread flags, recent searches, the shown messages with creators, room names, attachments
+  and boosts, a re-run FTS search, and the ids of the shown window).
+  A match is served and re-stamped; posts to other rooms keep pages. Shown messages are
+  compared by their fragment keys, so no timestamp stands in for content. The shown window
+  is selected again, ids only, from the arguments the page used (room and `before`/`after`/
+  `around` anchor, falling back to the latest page when an `around` anchor is gone), so any
+  write that adds, deletes or moves a message into or out of it re-renders the page,
+  including a foreign one rewriting `room_id` or `created_at`; writes that leave it as it was
+  keep the page. The selection reads only the `messages(room_id, created_at)` index.
+  `CAMPFIRE_CACHE_VERIFY=1` re-renders every revalidated hit, serves and counts the fresh
+  page on a mismatch. Mention names stay as cached, like the fragment cache. Rails has no
+  equivalent; output is unchanged. Session and access checks run on every request;
+  request variants (origin, user agent, cookie, session) stay separate and cookies and
+  security headers stay fresh. HEAD reuses GET bodies but never stores; flash-bearing
+  and bot-authenticated responses bypass the cache.
+  Verified in-process only: randomized domain/HTTP writes and a second SQLite connection,
+  each cached page compared byte for byte with an uncached render (and, for writes that keep
+  timestamps, with a render that rebuilds every message fragment); not yet exercised across
+  production cluster workers.
 - Large HTML is gzip, not brotli: spliced from cached deflate pieces (`CAMPFIRE_GZIP_CACHE_MB`,
   default 32) or built once per cached page. Digested assets are served from precompressed
   `.br`/`.gz` files built by `bin/build-assets.js`; the file set is read at startup.
+- Public responses are kept in memory per worker (`CAMPFIRE_PUBLIC_CACHE_MB`, default 32, 0
+  disables; LRU): each digested asset variant (identity/br/gzip) with prebuilt headers is answered
+  before Express, and avatar bodies are keyed by their ETag, which covers every body input
+  (user id, name, role, `updated_at` and the avatar blob's id, key and checksum), so changes,
+  including a foreign role change to bot that leaves `updated_at` alone, show on the next
+  request that reaches the server; browsers keep their copy for the 30-minute `max-age`
+  because the printed `?v=` follows `updated_at` only. A file is read on its
+  first request (served from disk meanwhile) and never re-read (files over half the budget
+  are never read, and ones resized since startup never stored). Range, `If-Match`,
+  `If-Unmodified-Since` and on-the-fly-compressed requests keep the file-serving chain. Status,
+  headers and bytes match it (diffed over every asset and encoding, and 2,010 captured
+  responses on the seed).
+- `/up` answers before the session middleware, as Rails' health controller does: no
+  `_campfire_session` cookie, ban check or `last_active_at` update. Matched paths, body and ETag
+  are unchanged.
 - Rails cookie decryption and signature checks are memoized in bounded LRUs; cookies with an
   expiry are re-checked on every hit.
 - Message notification, push and webhook jobs are enqueued in one batch after the response,
   through the primary (single writer). A hard crash between response and enqueue loses
   them; clean shutdown flushes. Jobs run in parallel up to `JOB_CONCURRENCY` (default 3),
-  so completion order is not queue order. The jobs DB uses `synchronous=NORMAL`.
+  so completion order is not queue order; free slots are leased in one jobs-DB commit.
+  The jobs DB uses `synchronous=NORMAL`.
+- Main-DB writes (`BEGIN IMMEDIATE` and autocommit `run()`) poll the write lock every
+  0.025-1.5 ms (jittered `Atomics.wait`) for up to 10 s instead of SQLite's busy handler,
+  which sleeps 1, 2, 5, 10... ms while a post holds the lock for about 0.2 ms; mixing the two
+  starved the slower one. Reads, the jobs DB and the checkpointer keep `busy_timeout`. New messages
+  insert their search-index row without a prior delete (`AUTOINCREMENT` ids, as Rails).
+- A publishing worker delivers broadcasts to its own sockets at once; the primary relays
+  them to the other workers over structured-clone (`advanced`) IPC. Workers may therefore
+  see concurrent messages in different orders (before, all followed the primary's relay
+  order); the client re-sorts appended messages by sort value.
 - WAL checkpoints run on a background thread (`src/checkpoint.js`) in the primary: PASSIVE
   every 250 ms, TRUNCATE above 64 MB, forced RESTART above `CAMPFIRE_WAL_MAX_MB` (256).
   Cluster web workers disable WAL autocheckpoint; single-process mode keeps a 64 MB backstop.
